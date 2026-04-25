@@ -1,0 +1,107 @@
+# ==============================================================================
+# CIVICLINK MONOREPO - MASTER .GITIGNORE
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. SECRETS & ENVIRONMENT VARIABLES (CRITICAL)
+# ------------------------------------------------------------------------------
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+*.pem
+# Ignore DKIM cryptographic keys explicitly
+dkim-private.pem
+dkim-public.pem
+
+# ------------------------------------------------------------------------------
+# 2. PYTHON BACKEND (FastAPI / LangGraph / Celery)
+# ------------------------------------------------------------------------------
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+venv/
+.venv/
+env/
+.env/
+
+# Pytest & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Celery & Workers
+celerybeat-schedule
+celerybeat.pid
+*.pid
+
+# ------------------------------------------------------------------------------
+# 3. NEXT.JS FRONTEND (React / TypeScript)
+# ------------------------------------------------------------------------------
+# Dependencies
+frontend/node_modules/
+node_modules/
+
+# Next.js build output
+frontend/.next/
+frontend/out/
+frontend/build/
+
+# Vercel / Deployment
+.vercel
+
+# Debug logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ------------------------------------------------------------------------------
+# 4. DATABASES, CACHES & LOCAL STORAGE
+# ------------------------------------------------------------------------------
+# The data folder we configured for SQLite databases (Rate limiter, Dispatch, Reputation)
+data/
+backend/data/
+
+# Downloaded AI Models (BAAI/bge-small SentenceTransformers)
+data/models/
+backend/data/models/
+
+# Prisma SQLite local databases (if used for testing)
+prisma/*.db
+prisma/*.db-journal
+prisma/*.db-wal
+prisma/*.db-shm
+
+# ------------------------------------------------------------------------------
+# 5. OS & IDE FILES
+# ------------------------------------------------------------------------------
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ------------------------------------------------------------------------------
+# 6. SCRAPING & PLAYWRIGHT
+# ------------------------------------------------------------------------------
+# Ignore any screenshots or trace files generated during local Playwright debugging
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
