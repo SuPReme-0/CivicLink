@@ -1,0 +1,607 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* =============================================================================
+   DESIGN TOKENS: CSS Variables for Dynamic Theming
+   ============================================================================= */
+:root {
+  /* Core Colors */
+  --background: #0a0e17;
+  --foreground: #f8fafc;
+  --primary: #38bdf8;
+  --primary-glow: rgba(56, 189, 248, 0.35);
+  --secondary: #8b5cf6;
+  --secondary-glow: rgba(139, 92, 246, 0.25);
+  
+  /* Glassmorphism Base */
+  --glass-bg: rgba(15, 23, 42, 0.65);
+  --glass-bg-hover: rgba(30, 41, 59, 0.75);
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --glass-border-hover: rgba(255, 255, 255, 0.15);
+  --glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+  
+  /* Role-Specific Accents */
+  --customer-accent: #22c55e;
+  --customer-accent-glow: rgba(34, 197, 94, 0.3);
+  --admin-accent: #6366f1;
+  --admin-accent-glow: rgba(99, 102, 241, 0.3);
+  
+  /* Status Colors */
+  --status-success: #22c55e;
+  --status-warning: #f59e0b;
+  --status-error: #ef4444;
+  --status-info: #38bdf8;
+  
+  /* Animation Timing */
+  --ease-snappy: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-smooth: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-bounce: cubic-bezier(0.68, -0.55, 0.265, 1.55);
+  
+  /* Blur & Depth */
+  --blur-sm: 4px;
+  --blur-md: 12px;
+  --blur-lg: 24px;
+  --blur-xl: 40px;
+}
+
+/* Dark mode support (auto) */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0a0e17;
+    --foreground: #f8fafc;
+  }
+}
+
+/* Reduced motion accessibility */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* =============================================================================
+   BASE STYLES & TYPOGRAPHY
+   ============================================================================= */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  scroll-behavior: smooth;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  @apply bg-[var(--background)] text-[var(--foreground)] antialiased;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  text-rendering: optimizeLegibility;
+  background-image: 
+    radial-gradient(circle at 20% 35%, rgba(56, 189, 248, 0.03) 0%, transparent 50%),
+    radial-gradient(circle at 80% 70%, rgba(139, 92, 246, 0.03) 0%, transparent 50%);
+  background-attachment: fixed;
+}
+
+/* Selection styling */
+::selection {
+  @apply bg-[var(--primary)] text-black;
+}
+
+/* =============================================================================
+   GLASSMORPHISM UTILITIES (Enhanced)
+   ============================================================================= */
+
+/* Base glass panel with layered blur and border gradient */
+.glass-panel {
+  @apply relative overflow-hidden rounded-2xl border border-[var(--glass-border)] 
+         bg-[var(--glass-bg)] backdrop-blur-[var(--blur-lg)] shadow-[var(--glass-shadow)];
+  transition: all 0.3s var(--ease-snappy);
+  will-change: transform, box-shadow;
+}
+
+.glass-panel::before {
+  content: '';
+  @apply absolute inset-0 bg-gradient-to-br from-white/5 to-transparent pointer-events-none;
+  opacity: 0;
+  transition: opacity 0.3s var(--ease-snappy);
+}
+
+.glass-panel::after {
+  content: '';
+  @apply absolute inset-0 border border-transparent rounded-2xl pointer-events-none;
+  background: linear-gradient(45deg, transparent, rgba(255,255,255,0.1), transparent) border-box;
+  -webkit-mask: linear-gradient(#fff 0 0) padding-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#fff 0 0) padding-box, linear-gradient(#fff 0 0);
+  mask-composite: exclude;
+  opacity: 0;
+  transition: opacity 0.3s var(--ease-snappy);
+}
+
+.glass-panel:hover {
+  @apply border-[var(--glass-border-hover)] bg-[var(--glass-bg-hover)];
+  transform: translateY(-2px);
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.4);
+}
+
+.glass-panel:hover::before,
+.glass-panel:hover::after {
+  opacity: 1;
+}
+
+.glass-panel:active {
+  transform: translateY(0);
+  transition-duration: 0.1s;
+}
+
+/* Glass input with focus glow */
+.glass-input {
+  @apply w-full bg-black/20 backdrop-blur-md border border-[var(--glass-border)] 
+         rounded-xl px-4 py-3 text-[var(--foreground)] placeholder:text-white/30
+         focus:border-[var(--primary)] focus:ring-2 focus:ring-[var(--primary-glow)] 
+         focus:outline-none transition-all duration-200;
+}
+
+.glass-input::placeholder {
+  transition: opacity 0.2s;
+}
+
+.glass-input:focus::placeholder {
+  opacity: 0.6;
+}
+
+/* Glass button with gradient and micro-interactions */
+.glass-btn {
+  @apply relative inline-flex items-center justify-center gap-2 px-6 py-3 
+         bg-gradient-to-r from-[var(--primary)] to-blue-500 text-white font-medium 
+         rounded-xl shadow-lg overflow-hidden transition-all duration-200
+         focus:outline-none focus:ring-2 focus:ring-[var(--primary-glow)] focus:ring-offset-2 focus:ring-offset-[var(--background)];
+  will-change: transform;
+}
+
+.glass-btn::before {
+  content: '';
+  @apply absolute inset-0 bg-white/20 opacity-0 transition-opacity duration-200;
+}
+
+.glass-btn:hover {
+  @apply shadow-[var(--primary-glow)];
+  transform: translateY(-1px);
+}
+
+.glass-btn:hover::before {
+  opacity: 1;
+}
+
+.glass-btn:active {
+  transform: translateY(1px);
+  transition-duration: 0.1s;
+}
+
+.glass-btn:disabled {
+  @apply opacity-50 cursor-not-allowed;
+  transform: none !important;
+}
+
+/* Variant: Outline glass button */
+.glass-btn-outline {
+  @apply bg-transparent border border-[var(--glass-border)] text-[var(--foreground)]
+         hover:border-[var(--primary)] hover:text-[var(--primary)];
+}
+
+/* Variant: Role-specific accents */
+.glass-btn-customer {
+  @apply from-[var(--customer-accent)] to-green-500 focus:ring-[var(--customer-accent-glow)];
+}
+
+.glass-btn-admin {
+  @apply from-[var(--admin-accent)] to-indigo-500 focus:ring-[var(--admin-accent-glow)];
+}
+
+/* =============================================================================
+   CHAT INTERFACE STYLES (Customer Dashboard)
+   ============================================================================= */
+
+/* Chat container with subtle gradient border */
+.chat-container {
+  @apply glass-panel rounded-3xl p-4 md:p-6 flex flex-col h-[calc(100vh-120px)] 
+         border-t border-l border-r border-b-0 md:border-b;
+}
+
+/* Message bubbles with entrance animations */
+.chat-bubble {
+  @apply max-w-[85%] md:max-w-[70%] p-4 rounded-2xl backdrop-blur-md 
+         border border-white/10 shadow-lg animate-slide-up;
+  will-change: transform, opacity;
+}
+
+@keyframes slide-up {
+  from {
+    opacity: 0;
+    transform: translateY(20px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.animate-slide-up {
+  animation: slide-up 0.4s var(--ease-snappy) forwards;
+}
+
+/* Incoming message (system/citizen) */
+.chat-bubble-in {
+  @apply chat-bubble bg-[var(--glass-bg)] rounded-tl-none 
+         origin-bottom-left border-l-4 border-l-[var(--primary)];
+}
+
+/* Outgoing message (user) */
+.chat-bubble-out {
+  @apply chat-bubble bg-gradient-to-br from-[var(--customer-accent)] to-green-600 
+         text-white rounded-tr-none origin-bottom-right ml-auto 
+         border-r-4 border-r-white/20;
+}
+
+/* Typing indicator with animated dots */
+.typing-indicator {
+  @apply flex items-center gap-1 px-4 py-3;
+}
+
+.typing-dot {
+  @apply w-2 h-2 bg-white/60 rounded-full animate-bounce;
+  animation-delay: calc(var(--i) * 0.15s);
+}
+
+.typing-dot:nth-child(1) { --i: 1; }
+.typing-dot:nth-child(2) { --i: 2; }
+.typing-dot:nth-child(3) { --i: 3; }
+
+@keyframes bounce {
+  0%, 80%, 100% { transform: scale(0.6); opacity: 0.5; }
+  40% { transform: scale(1); opacity: 1; }
+}
+
+.animate-bounce {
+  animation: bounce 1.4s var(--ease-bounce) infinite;
+}
+
+/* Message status indicators */
+.message-status {
+  @apply flex items-center gap-1 text-xs text-white/60 mt-1;
+}
+
+.status-sent { @apply text-white/60; }
+.status-delivered { @apply text-[var(--status-success)]; }
+.status-read { @apply text-[var(--primary)]; }
+
+/* Attachment preview */
+.attachment-preview {
+  @apply relative rounded-xl overflow-hidden border border-white/10 
+         bg-black/20 backdrop-blur-sm group cursor-pointer;
+  transition: all 0.2s var(--ease-snappy);
+}
+
+.attachment-preview:hover {
+  @apply border-[var(--primary)] shadow-[var(--primary-glow)];
+  transform: scale(1.02);
+}
+
+.attachment-preview img {
+  @apply w-full h-32 object-cover transition-transform duration-300;
+}
+
+.attachment-preview:hover img {
+  transform: scale(1.05);
+}
+
+/* =============================================================================
+   ADMIN DASHBOARD STYLES (Mission Control)
+   ============================================================================= */
+
+/* Metric card with hover lift and glow */
+.metric-card {
+  @apply glass-panel p-5 rounded-2xl cursor-default group;
+}
+
+.metric-card:hover {
+  @apply border-[var(--admin-accent)];
+  box-shadow: 0 12px 48px var(--admin-accent-glow);
+}
+
+.metric-value {
+  @apply text-3xl font-bold bg-gradient-to-r from-white to-[var(--admin-accent)] 
+         bg-clip-text text-transparent transition-all duration-300;
+}
+
+.metric-card:hover .metric-value {
+  background-position: 100% center;
+}
+
+.metric-label {
+  @apply text-sm text-white/60 group-hover:text-white/80 transition-colors;
+}
+
+/* Status badge with pulse animation */
+.status-badge {
+  @apply inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium 
+         border backdrop-blur-sm transition-all duration-200;
+}
+
+.status-badge::before {
+  content: '';
+  @apply w-1.5 h-1.5 rounded-full animate-pulse;
+}
+
+.status-badge.received { @apply bg-blue-500/10 border-blue-500/30 text-blue-300; }
+.status-badge.received::before { @apply bg-blue-400; }
+
+.status-badge.verifying { @apply bg-yellow-500/10 border-yellow-500/30 text-yellow-300; }
+.status-badge.verifying::before { @apply bg-yellow-400; }
+
+.status-badge.dispatched { @apply bg-green-500/10 border-green-500/30 text-green-300; }
+.status-badge.dispatched::before { @apply bg-green-400; animation: none; }
+
+.status-badge.failed { @apply bg-red-500/10 border-red-500/30 text-red-300; }
+.status-badge.failed::before { @apply bg-red-400; animation: none; }
+
+/* Table row with hover highlight and subtle slide */
+.table-row {
+  @apply border-b border-white/5 hover:bg-white/5 transition-all duration-200;
+  transform-origin: left;
+}
+
+.table-row:hover {
+  transform: translateX(4px);
+  border-left: 3px solid var(--admin-accent);
+  padding-left: calc(1.25rem - 3px); /* Compensate for border */
+}
+
+/* Loading skeleton with shimmer effect */
+.skeleton {
+  @apply relative overflow-hidden bg-white/5 rounded-lg;
+}
+
+.skeleton::after {
+  content: '';
+  @apply absolute inset-0 bg-gradient-to-r from-transparent via-white/10 to-transparent;
+  animation: shimmer 1.5s infinite;
+  transform: translateX(-100%);
+}
+
+@keyframes shimmer {
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+/* Real-time update indicator */
+.live-indicator {
+  @apply flex items-center gap-2 text-xs font-medium text-[var(--status-success)];
+}
+
+.live-dot {
+  @apply w-2 h-2 rounded-full bg-[var(--status-success)] animate-pulse-ring;
+}
+
+@keyframes pulse-ring {
+  0% {
+    box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.4);
+  }
+  70% {
+    box-shadow: 0 0 0 8px transparent;
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+.animate-pulse-ring {
+  animation: pulse-ring 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* =============================================================================
+   LOADING & CONNECTION STATES
+   ============================================================================= */
+
+/* Full-page loading overlay */
+.loading-overlay {
+  @apply fixed inset-0 bg-[var(--background)]/90 backdrop-blur-sm z-50 
+         flex items-center justify-center;
+}
+
+.loading-spinner {
+  @apply w-12 h-12 border-4 border-[var(--glass-border)] border-t-[var(--primary)] 
+         rounded-full animate-spin;
+  animation-duration: 1s;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.animate-spin {
+  animation: spin 1s linear infinite;
+}
+
+/* Connection status bar */
+.connection-bar {
+  @apply fixed top-0 left-0 right-0 h-1 z-50 transition-all duration-300;
+}
+
+.connection-bar.online { @apply bg-gradient-to-r from-[var(--status-success)] to-green-400; }
+.connection-bar.offline { @apply bg-gradient-to-r from-[var(--status-error)] to-red-400; }
+.connection-bar.reconnecting { 
+  @apply bg-gradient-to-r from-[var(--status-warning)] to-yellow-400;
+  animation: pulse-bar 1.5s infinite;
+}
+
+@keyframes pulse-bar {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+/* =============================================================================
+   INTERACTIVE COMPONENT EFFECTS
+   ============================================================================= */
+
+/* Hover lift with shadow glow */
+.hover-lift {
+  @apply transition-all duration-300 will-change-transform;
+}
+
+.hover-lift:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.4);
+}
+
+/* Click ripple effect (for buttons) */
+.ripple {
+  @apply relative overflow-hidden;
+}
+
+.ripple::after {
+  content: '';
+  @apply absolute inset-0 bg-white/20 rounded-full scale-0 opacity-0 
+         transition-all duration-500 pointer-events-none;
+}
+
+.ripple:active::after {
+  @apply scale-[3] opacity-100;
+  transition-duration: 0.3s;
+}
+
+/* Focus ring for accessibility */
+.focus-ring {
+  @apply focus:outline-none focus:ring-2 focus:ring-[var(--primary-glow)] 
+         focus:ring-offset-2 focus:ring-offset-[var(--background)];
+}
+
+/* =============================================================================
+   UTILITIES & HELPERS
+   ============================================================================= */
+
+/* Text gradient utility */
+.text-gradient {
+  @apply bg-gradient-to-r from-white to-[var(--primary)] bg-clip-text text-transparent;
+}
+
+.text-gradient-admin {
+  @apply bg-gradient-to-r from-white to-[var(--admin-accent)] bg-clip-text text-transparent;
+}
+
+.text-gradient-customer {
+  @apply bg-gradient-to-r from-white to-[var(--customer-accent)] bg-clip-text text-transparent;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-white/10 rounded-full hover:bg-white/20 transition-colors;
+}
+
+/* Prevent layout shift on image load */
+img {
+  @apply aspect-auto;
+}
+
+/* Smooth image transitions */
+.image-fade {
+  @apply transition-opacity duration-300;
+}
+
+.image-fade.loading {
+  @apply opacity-0;
+}
+
+.image-fade.loaded {
+  @apply opacity-100;
+}
+
+/* =============================================================================
+   ANIMATION UTILITIES (Framer Motion Helpers)
+   ============================================================================= */
+
+/* Staggered entrance for lists */
+.stagger-item {
+  @apply opacity-0 translate-y-4;
+  animation: stagger-in 0.4s var(--ease-snappy) forwards;
+}
+
+@keyframes stagger-in {
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Delay utilities for staggering */
+.stagger-1 { animation-delay: 0.05s; }
+.stagger-2 { animation-delay: 0.1s; }
+.stagger-3 { animation-delay: 0.15s; }
+.stagger-4 { animation-delay: 0.2s; }
+.stagger-5 { animation-delay: 0.25s; }
+
+/* Fade in utility */
+.fade-in {
+  @apply opacity-0;
+  animation: fade-in 0.3s var(--ease-smooth) forwards;
+}
+
+@keyframes fade-in {
+  to { opacity: 1; }
+}
+
+/* Scale in utility */
+.scale-in {
+  @apply opacity-0 scale-95;
+  animation: scale-in 0.3s var(--ease-snappy) forwards;
+}
+
+@keyframes scale-in {
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* =============================================================================
+   RESPONSIVE ADJUSTMENTS
+   ============================================================================= */
+
+@media (max-width: 768px) {
+  .glass-panel {
+    @apply rounded-xl;
+  }
+  
+  .chat-bubble {
+    @apply max-w-[90%];
+  }
+  
+  .metric-value {
+    @apply text-2xl;
+  }
+}
+
+/* High DPI display optimizations */
+@media (-webkit-min-device-pixel-ratio: 2), (min-resolution: 192dpi) {
+  .glass-panel::after {
+    -webkit-mask-composite: source-out;
+    mask-composite: exclude;
+  }
+}
