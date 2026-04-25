@@ -12,6 +12,7 @@ generator py_client {
 generator js_client {
   provider        = "prisma-client-js"
   previewFeatures = ["postgresqlExtensions"]
+  output          = "../frontend/node_modules/.prisma/client"
 }
 
 datasource db {
@@ -50,6 +51,7 @@ enum GrievanceStatus {
   REJECTED_FRAUD
   ESCALATED
   FAILED
+  
 }
 
 enum VerificationStatus {
