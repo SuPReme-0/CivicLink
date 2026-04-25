@@ -1,0 +1,477 @@
+// schema.prisma
+// CivicLink: Production-Ready "Fort Knox" Data Layer
+// Synchronizes LangGraph backend, Next.js dashboard, async worker queues, and cryptographic security.
+
+generator py_client {
+  provider             = "prisma-client-py"
+  previewFeatures      = ["postgresqlExtensions"]
+  recursive_type_depth = 5
+  enable_experimental_decimal = true
+}
+
+generator js_client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [vector] // 🚨 Tells Prisma to install the vector extension
+}
+
+// ─────────────────────────────────────────────────────────────
+// GLOBAL ENUMS: Strict Type Safety
+// ─────────────────────────────────────────────────────────────
+
+enum AdminRole {
+  SUPER_ADMIN
+  MODERATOR
+  DATA_ENTRY
+}
+
+enum SeverityLevel {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum GrievanceStatus {
+  RECEIVED
+  VERIFYING_IMAGE
+  ROUTING_JURISDICTION
+  DISCOVERING_CONTACT
+  DRAFTING_LETTER
+  AWAITING_REVIEW      // 🚨 HITL: LangGraph paused, waiting for Admin
+  DISPATCHING
+  DISPATCHED
+  RESOLVED
+  REJECTED_FRAUD
+  ESCALATED
+  FAILED
+}
+
+enum VerificationStatus {
+  PENDING
+  VERIFIED_SMTP
+  SUSPICIOUS
+  FAILED
+}
+
+enum DispatchChannel {
+  SMTP
+  PORTAL_FORM
+  ESCALATION_EMAIL
+}
+
+enum DispatchStatus {
+  QUEUED
+  SENT
+  DELIVERED
+  BOUNCED
+  FAILED
+  RETRYING
+}
+
+enum WebhookStatus {
+  PENDING
+  PROCESSED
+  DROPPED_DUPLICATE
+  DROPPED_SIGNATURE_FAIL
+  FAILED
+}
+
+// ─────────────────────────────────────────────────────────────
+// 1. INGESTION EDGE & IDEMPOTENCY (Replay Attack Prevention)
+// ─────────────────────────────────────────────────────────────
+
+model WebhookEvent {
+  id               String        @id @default(cuid())
+  provider         String        @default("META_WHATSAPP")
+  
+  // SHA-256 hash of the exact raw body. Drops 24-hour duplicates.
+  payloadHash      String        @unique 
+  
+  // Encrypted raw payload, kept only for debugging, then purged via Cron.
+  encryptedPayload String        @db.Text 
+  
+  status           WebhookStatus @default(PENDING)
+  errorMessage     String?       @db.Text
+  
+  createdAt        DateTime      @default(now())
+  processedAt      DateTime?
+
+  @@index([status, createdAt])
+  @@map("webhook_events")
+}
+
+// ─────────────────────────────────────────────────────────────
+// 2. HARDENED ADMIN & ZERO-TRUST SESSIONS
+// ─────────────────────────────────────────────────────────────
+
+model AdminUser {
+  id                      String   @id @default(cuid())
+  email                   String   @unique
+  passwordHash            String
+  
+  // Security Protocols
+  mfaEnabled              Boolean  @default(false)
+  mfaSecret               String?  // Encrypted TOTP Secret
+  failedLoginAttempts     Int      @default(0)
+  lastLoginAt             DateTime?
+  accountLockedUntil      DateTime?
+
+  role                    AdminRole @default(MODERATOR)
+  jurisdictionAccessState String?  
+  createdAt               DateTime  @default(now())
+
+  // Relations
+  reviewedGrievances      GrievanceCase[]
+  overriddenContacts      AdministrativeHierarchy[]
+  securityLogs            SecurityAuditLog[] 
+  sessions                AdminSession[]
+  
+  @@map("admin_users")
+}
+
+model AdminSession {
+  id               String    @id @default(cuid())
+  adminId          String
+  
+  sessionTokenHash String    @unique // Hashed token, never plaintext
+  ipAddress        String?
+  userAgent        String?
+  
+  // Kill Switch & Lifecycle
+  isRevoked        Boolean   @default(false)
+  expiresAt        DateTime
+  createdAt        DateTime  @default(now())
+  lastActiveAt     DateTime  @default(now())
+
+  admin            AdminUser @relation(fields: [adminId], references: [id], onDelete: Cascade)
+
+  @@index([adminId, isRevoked])
+  @@map("admin_sessions")
+}
+
+model SecurityAuditLog {
+  id               String    @id @default(cuid())
+  adminId          String?   // 🚨 Nullable to prevent deletion crashes
+  action           String    // e.g., "OVERRODE_CONTACT", "REVOKED_SESSION"
+  
+  // Tamper-Evident Cryptographic Chain
+  previousHash     String?   @unique 
+  currentHash      String    @unique
+  
+  ipAddress        String?   // Hashed IP
+  userAgent        String?
+  targetResourceId String?   
+  timestamp        DateTime  @default(now())
+
+  // 🚨 SetNull ensures immutable logs remain even if the admin is purged
+  admin            AdminUser? @relation(fields: [adminId], references: [id], onDelete: SetNull)
+
+  @@index([adminId, timestamp(sort: Desc)])
+  @@map("security_audit_logs")
+}
+
+// ─────────────────────────────────────────────────────────────
+// 3. CITIZEN CRYPTOGRAPHY & ANONYMIZATION
+// ─────────────────────────────────────────────────────────────
+
+model Citizen {
+  id               String         @id @default(cuid())
+  whatsappId       String         @unique 
+  
+  // Cryptographic Blind Indexing
+  phoneHash        String         @unique // O(1) Lookups
+  encryptedPhone   String         @db.Text// AES-256-GCM ciphertext
+  encryptedName    String?        @db.Text
+  encryptionKeyVer String         @default("v1") // KMS Key Rotation
+  
+  // Automated Abuse Prevention
+  trustScore       Float          @default(1.0)
+  isRateLimitedUntil DateTime?    
+  
+  languagePref     String         @default("en")
+  isBanned         Boolean        @default(false)
+  
+  // Compliance / Right to be Forgotten
+  anonymizedAt     DateTime?      
+  createdAt        DateTime       @default(now())
+
+  locations        UserLocation[]
+  threads          GrievanceThread[]
+  grievances       GrievanceCase[]
+
+  @@index([trustScore])
+  @@map("citizens")
+}
+
+model UserLocation {
+  id               String   @id @default(cuid())
+  citizenId        String
+  label            String?  
+  
+  // Precision GPS. Rounded to Ward center if user is anonymized.
+  latitude         Decimal  @db.Decimal(10, 8)
+  longitude        Decimal  @db.Decimal(11, 8)
+  
+  encryptedAddress String?  @db.Text 
+  
+  ward             String?
+  district         String?
+  state            String?
+  pincode          String?
+  isDefault        Boolean  @default(false)
+  createdAt        DateTime @default(now())
+
+  citizen          Citizen  @relation(fields: [citizenId], references: [id], onDelete: Cascade)
+  grievances       GrievanceCase[]
+
+  @@map("user_locations")
+}
+
+// ─────────────────────────────────────────────────────────────
+// 4. ADMINISTRATIVE HIERARCHY (Global Scraper Cache & RAG)
+// ─────────────────────────────────────────────────────────────
+
+model AdministrativeHierarchy {
+  id                    String   @id @default(cuid())
+  
+  // Geographical & Domain Keys (Composite Index)
+  state                 String
+  district              String
+  municipality          String?
+  ward                  String?
+  issueCategory         String   
+  
+  // Scraped Contact Data
+  officialDesignation   String
+  officialName          String?
+  officialEmail         String?
+  portalUrl             String?  @db.Text
+  
+  // Verification & Frontend Overrides
+  status                VerificationStatus @default(PENDING)
+  lastVerifiedAt        DateTime?
+  isManuallyOverridden  Boolean            @default(false) // Playwright Lockout
+  adminNotes            String?            @db.Text
+
+  // 🚨 AI Embeddings for Jurisdiction RAG Routing
+  embedding             Unsupported("vector(384)")?
+  searchContext         String?            @db.Text // Raw string used for vector generation
+
+  // Escalation Tree (Self-Referencing)
+  escalationContactId   String?            
+  escalationContact     AdministrativeHierarchy?  @relation("EscalationTree", fields: [escalationContactId], references: [id])
+  escalatedFrom         AdministrativeHierarchy[] @relation("EscalationTree")
+
+  overriddenById        String?            
+  // 🚨 SetNull ensures cache isn't destroyed if a moderator is deleted
+  overriddenBy          AdminUser?         @relation(fields: [overriddenById], references: [id], onDelete: SetNull)
+  
+  dispatchedGrievances  GrievanceCase[]
+  dispatchLogs          DispatchRecord[]
+
+  @@unique([state, district, municipality, ward, issueCategory])
+  @@map("administrative_hierarchy")
+}
+
+// ─────────────────────────────────────────────────────────────
+// 5. LANGGRAPH STATE & GRIEVANCE CORE
+// ─────────────────────────────────────────────────────────────
+
+model GrievanceThread {
+  id               String          @id @default(cuid())
+  citizenId        String
+  threadId         String          @unique // Native LangGraph thread_id
+  
+  // Business logic tracking
+  status           GrievanceStatus @default(RECEIVED)
+  lastExecutedNode String?         
+  retryCount       Int             @default(0)
+  maxRetries       Int             @default(3)
+  
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt @db.Timestamptz
+
+  citizen          Citizen         @relation(fields: [citizenId], references: [id], onDelete: Restrict)
+  case             GrievanceCase?
+  auditEvents      AuditEvent[]
+
+  // Note: Redundant @@index([threadId]) removed (handled by @unique)
+  @@index([status, updatedAt(sort: Desc)])
+  @@map("grievance_threads")
+}
+
+model GrievanceCase {
+  id                   String          @id @default(cuid())
+  trackingId           String          @unique // CIVIC-WB-2026-XXXX
+  citizenId            String
+  threadId             String          @unique // Foreign key to GrievanceThread
+  locationId           String?
+  
+  issueCategory        String
+  descriptionText      String          @db.Text
+  severity             SeverityLevel   @default(MEDIUM)
+  rawInputPayload      Json            
+  legalReferences      String[]        
+  systemMetadata       Json?
+
+  // 🚨 HITL Accountability
+  reviewedById         String?         
+  reviewedAt           DateTime?
+  reviewDecision       String?         // "APPROVED", "REJECTED", "ESCALATED"
+  reviewNotes          String?         @db.Text // Admin justification
+
+  status               GrievanceStatus @default(RECEIVED)
+  
+  dispatchedToId       String?         
+  finalDispatchRef     String?         // Fast lookup for SMTP Message-ID
+
+  createdAt            DateTime        @default(now())
+  updatedAt            DateTime        @updatedAt @db.Timestamptz
+
+  // 🚨 Defensive Relations (SetNull to prevent historical deletion crashes)
+  reviewedBy           AdminUser?      @relation(fields: [reviewedById], references: [id], onDelete: SetNull)
+  dispatchedTo         AdministrativeHierarchy? @relation(fields: [dispatchedToId], references: [id], onDelete: SetNull)
+  
+  citizen              Citizen         @relation(fields: [citizenId], references: [id], onDelete: Cascade)
+  // 🚨 Synced via references: [threadId] to directly map to the LangGraph native namespace
+  thread               GrievanceThread @relation(fields: [threadId], references: [threadId], onDelete: Cascade)
+  location             UserLocation?   @relation(fields: [locationId], references: [id], onDelete: SetNull)
+  
+  images               ImageEvidence[]
+  dispatchRecords      DispatchRecord[]
+  auditEvents          AuditEvent[]
+
+  // Note: Redundant @@index([trackingId]) removed (handled by @unique)
+  @@index([status, severity])
+  @@map("grievance_cases")
+}
+
+// ─────────────────────────────────────────────────────────────
+// 6. AI FORENSICS (Media Sandboxing & VLM Audit)
+// ─────────────────────────────────────────────────────────────
+
+model ImageEvidence {
+  id               String        @id @default(cuid())
+  grievanceId      String
+  
+  // Security Protocol: Presigned URLs via Object Key only
+  storageBucket    String        @default("civiclink-evidence-sandbox")
+  objectKey        String        @unique 
+  mediaType        String?       
+  
+  exifMetadata     Json?         // GPS strictly stripped
+  vlmOutput        Json?         
+  
+  elaScore         Float?        
+  aiGenProbability Float?        
+  perceivedHash    String?       
+  
+  isGenuine        Boolean       @default(false)
+  confidenceScore  Float         
+  tamperingFlags   String[]      
+
+  createdAt        DateTime      @default(now())
+  grievance        GrievanceCase @relation(fields: [grievanceId], references: [id], onDelete: Cascade)
+
+  @@index([grievanceId])
+  @@index([perceivedHash])
+  @@map("image_evidence")
+}
+
+// ─────────────────────────────────────────────────────────────
+// 7. DISPATCH OUTBOX (Async Worker Queue)
+// ─────────────────────────────────────────────────────────────
+
+model DispatchRecord {
+  id               String          @id @default(cuid())
+  grievanceId      String
+  contactId        String?         // 🚨 Changed to Nullable
+  
+  channel          DispatchChannel
+  status           DispatchStatus  @default(QUEUED)
+  
+  targetEmail      String?
+  targetPortalUrl  String?         @db.Text
+  subjectLine      String
+  bodyText         String          @db.Text
+  
+  externalRef      String?         
+  errorMessage     String?         @db.Text
+  retryCount       Int             @default(0)
+  
+  dispatchedAt     DateTime        @default(now())
+  completedAt      DateTime?
+
+  grievance        GrievanceCase   @relation(fields: [grievanceId], references: [id], onDelete: Cascade)
+  // 🚨 Added SetNull so clearing the scraper cache doesn't orphan dispatch records
+  contact          AdministrativeHierarchy? @relation(fields: [contactId], references: [id], onDelete: SetNull)
+
+  @@index([status]) 
+  @@index([externalRef])
+  @@map("dispatch_records")
+}
+
+// ─────────────────────────────────────────────────────────────
+// 8. IMMUTABLE SYSTEM LOGS (LangGraph Telemetry)
+// ─────────────────────────────────────────────────────────────
+
+model AuditEvent {
+  id               String          @id @default(cuid())
+  threadId         String
+  grievanceId      String?
+  
+  node             String          
+  action           String          
+  status           String          
+  
+  payload          Json?           
+  errorMessage     String?         @db.Text
+  durationMs       Int?
+  
+  timestamp        DateTime        @default(now())
+
+  thread           GrievanceThread @relation(fields: [threadId], references: [threadId], onDelete: Cascade)
+  grievance        GrievanceCase?  @relation(fields: [grievanceId], references: [id], onDelete: Cascade)
+
+  @@index([threadId, timestamp(sort: Desc)])
+  @@map("audit_events")
+}
+
+// ─────────────────────────────────────────────────────────────
+// 9. LEGAL RAG DATABASE (Used by drafting.py)
+// ─────────────────────────────────────────────────────────────
+model LegalCitation {
+  id                   String   @id @default(cuid())
+  actName              String   @db.VarChar(200)  // e.g., "West Bengal Municipal Act, 1993"
+  section              String   @db.VarChar(50)   // e.g., "Section 215"
+  description          String   @db.Text          // Plain English explanation
+  penalty              String?  @db.Text          // Consequences of non-compliance
+  enforcingAuthority   String   @db.VarChar(100)  // e.g., "Municipal Commissioner"
+  
+  // Jurisdiction scope
+  state                String?  @db.VarChar(100)
+  district             String?  @db.VarChar(100)
+  applicableNationwide Boolean  @default(false)
+  
+  // Issue category mapping (for RAG retrieval)
+  issueCategory        String   @db.VarChar(50)   // e.g., "garbage", "pothole"
+  
+  // pgvector embedding for semantic search (384-dim)
+  embedding            Unsupported("vector(384)")?
+  
+  // Metadata
+  sourceUrl            String?
+  lastVerified         DateTime?
+  relevanceScore       Float    @default(1.0)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  @@index([issueCategory, state])
+  @@map("legal_citations")
+}
