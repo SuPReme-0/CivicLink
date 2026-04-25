@@ -1,0 +1,52 @@
+# ==========================================
+# CIVICLINK BACKEND - MASTER REQUIREMENTS
+# ==========================================
+
+# --- CORE & API ---
+fastapi>=0.110.1          
+uvicorn[standard]>=0.29.0 
+pydantic>=2.7.0           
+pydantic-settings>=2.2.1  # Required for SettingsConfigDict
+python-dotenv>=1.0.1      
+
+# --- DATABASE & ORM (Stage 1) ---
+prisma>=0.13.1            # CRITICAL: Our actual ORM. 
+
+# --- LANGGRAPH & AI BRAIN (Stage 2) ---
+langgraph>=0.0.35         
+langchain-core>=0.1.45    
+google-generativeai>=0.7.0 
+groq>=0.9.0               
+openai>=1.35.0            # For vLLM
+
+# --- FORENSICS & IMAGE PROCESSING ---
+pillow>=10.3.0            
+opencv-python-headless>=4.9.0 
+numpy>=1.26.0             
+aiohttp>=3.9.5            
+
+# --- OBSERVABILITY & RATE LIMITING ---
+aiosqlite>=0.20.0         # Rate Limiter & Dispatch Cache
+tenacity>=8.2.3          
+opentelemetry-api>=1.24.0 
+opentelemetry-sdk>=1.24.0 
+prometheus-fastapi-instrumentator>=7.0.0 
+
+# --- WEB SCRAPING & VERIFICATION (Stage 3 & 4) ---
+playwright>=1.43.0        
+beautifulsoup4>=4.12.3    
+lxml>=5.2.1               
+dnspython>=2.6.1          
+async-lru>=2.0.4          # For Jurisdiction caching
+
+# --- DISPATCH LAYER (Stage 5b) ---
+aiosmtplib>=3.0.1         # Async SMTP execution
+dkimpy>=1.1.6             # DKIM Cryptographic signing
+
+# --- SECURITY & CRYPTOGRAPHY ---
+cryptography>=42.0.5      
+pyjwt>=2.8.0              
+passlib[bcrypt]>=1.7.4    
+
+# --- ASYNC WORKERS ---
+celery>=5.3.6
