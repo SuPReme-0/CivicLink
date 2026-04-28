@@ -5,14 +5,16 @@ Production Legal Drafting Node.
 FEATURES:
 - Multi-language detection & normalization (Bengali/Hindi/Hinglish → Formal English)
 - Legal RAG: Jurisdiction-aware citation injection via pgvector (Global DB Singleton)
-- Groq-powered inference with strict JSON object enforcement and 4000 token limit
+- Groq-powered inference with strict JSON object enforcement
 - Native integration with SQLite multi-worker Rate Limiter
-- Responsive, semantic HTML email generation (replaces raw <pre> tags)
-- PII-Safe Output: Prompt-level instruction to redact citizen personal data
+- Responsive, semantic HTML email generation
+- Strict State Merging (Preserves VLM and Jurisdiction confidence scores)
+- PII-Safe Output: Zero-disclosure redaction for strict IDs
 """
 import re
 import asyncio
 import logging
+import json
 from typing import Dict, Any, Optional, List, Literal
 from datetime import datetime, timezone
 
@@ -23,8 +25,8 @@ from pydantic import BaseModel, Field, ValidationError
 from backend.brain.state import CivicLinkState
 from backend.core.config import settings
 from backend.core.observability import get_tracer
-from backend.core.db import prisma_client  # 🚨 Global DB Singleton
-from backend.core.rate_limiter import rate_limiter  # 🚨 Global Rate Limiter
+from backend.core.db import prisma  
+from backend.core.rate_limiter import rate_limiter  
 
 logger = logging.getLogger(__name__)
 tracer = get_tracer("drafting_node")
@@ -58,7 +60,8 @@ def _normalize_to_formal_english(text: str, original_lang: str) -> str:
     }
     normalized = text.lower().strip()
     for informal, formal in TRANSLATION_DICT.items():
-        normalized = re.sub(rf"\b{re.escape(informal)}\b", formal, normalized, flags=re.I)
+        # 🚨 FIX: Safe boundary checks that don't break on Unicode/Devanagari
+        normalized = re.sub(rf"(?<![a-zA-Z0-9]){re.escape(informal)}(?![a-zA-Z0-9])", formal, normalized, flags=re.I)
     normalized = re.sub(r"\b(i|we|our)\b", lambda m: m.group(1).upper(), normalized)
     return re.sub(r"[!?]{2,}", ".", normalized).strip()
 
@@ -70,29 +73,36 @@ async def _fetch_legal_citations(
     issue_category: str,
     severity: str
 ) -> List[Dict[str, str]]:
-    if not prisma_client.is_connected():
-        await prisma_client.connect()
-        
-    citations = await prisma_client.legalcitation.find_many(
-        where={
-            "issueCategory": {"contains": issue_category},
-            "OR": [
-                {"state": jurisdiction.get("state")},
-                {"district": jurisdiction.get("district")},
-                {"applicableNationwide": True}
-            ]
-        },
-        order={"relevanceScore": "desc"},
-        take=5
-    )
     
-    return [{
-        "act_name": c.actName,
-        "section": c.section,
-        "description": c.description,
-        "penalty": c.penalty,
-        "authority": c.enforcingAuthority
-    } for c in citations]
+    # 🚨 FIX: Graceful degradation. If DB drops, we still generate the draft without citations.
+    try:
+        if not prisma.is_connected():
+            await prisma.connect()
+            
+        citations = await prisma.legalcitation.find_many(
+            where={
+                "issueCategory": {"contains": issue_category},
+                "OR": [
+                    {"state": jurisdiction.get("state")},
+                    {"district": jurisdiction.get("district")},
+                    {"applicableNationwide": True}
+                ]
+            },
+            order={"relevanceScore": "desc"},
+            take=5
+        )
+        
+        return [{
+            "act_name": c.actName,
+            "section": c.section,
+            "description": c.description,
+            "penalty": c.penalty,
+            "authority": c.enforcingAuthority
+        } for c in citations]
+        
+    except Exception as e:
+        logger.warning(f"Legal citation DB unreachable, proceeding with general rights: {e}")
+        return []
 
 # ---------------------------------------------------------
 # 3. STRICT OUTPUT SCHEMA
@@ -155,14 +165,14 @@ Relevant Legal Citations:
 2. Use respectful but firm bureaucratic language appropriate for Indian government correspondence.
 3. Structure the email with clear sections. Include ALL provided legal citations.
 4. Request a specific timeline for acknowledgment ({urgency}).
-5. 🚨 PII REDACTION: You MUST scrub all personal identifiers from the citizen's text. 
-   Replace any Phone Numbers, Aadhaar Numbers (12 digits), PAN cards, or personal names with "[REDACTED]".
+5. 🚨 PII REDACTION: You MUST strictly scrub sensitive personal identifiers from the citizen's text. 
+    Replace any Aadhaar Numbers with "[Aadhaar Redacted]", RRNs (Resident Registration Numbers) with "[RRN Omitted]", MyNumber (Japanese Individual Number) with "[MyNumber Redacted]", and any Phone Numbers, PAN cards, or personal names with "[REDACTED]".
 6. Output STRICTLY in valid JSON matching this schema:
-{DraftedEmailSchema.schema_json(indent=2)}
+{json.dumps(DraftedEmailSchema.model_json_schema(), indent=2)}
 """
 
 # ---------------------------------------------------------
-# 5. GROQ INFERENCE CLIENT (Rate-Limited + 4000 Tokens)
+# 5. GROQ INFERENCE CLIENT (Rate-Limited)
 # ---------------------------------------------------------
 _groq_client: Optional[AsyncGroq] = None
 
@@ -170,8 +180,9 @@ async def _get_groq_client() -> AsyncGroq:
     global _groq_client
     if _groq_client is None:
         _groq_client = AsyncGroq(
-            api_key=settings.GROQ_API_KEY,
-            timeout=getattr(settings, "FALLBACK_TIMEOUT_SECONDS", 15),
+            api_key=getattr(settings, "GROQ_API_KEY", ""),
+            # 🚨 FIX: Extended timeout for heavy JSON text generation (45s instead of 15s)
+            timeout=getattr(settings, "DRAFTING_TIMEOUT_SECONDS", 45.0),
             max_retries=2
         )
     return _groq_client
@@ -179,38 +190,46 @@ async def _get_groq_client() -> AsyncGroq:
 async def _generate_draft_via_groq(prompt: str, config: RunnableConfig) -> Dict[str, Any]:
     client = await _get_groq_client()
     
-    # 🚨 Rate Limiter Integration
+    # 🚨 FIX: Define the safe model variable once
+    safe_model = getattr(settings, "GROQ_DRAFTING_MODEL", "llama-3.3-70b-versatile")
+    
     thread_id = config.get("configurable", {}).get("thread_id", "default")
-    api_key_hash = f"groq_drafting_{hash(settings.GROQ_API_KEY + thread_id) % 10000}"
+    api_key_hash = f"groq_drafting_{hash(getattr(settings, 'GROQ_API_KEY', '') + thread_id) % 10000}"
     token_estimate = (len(prompt) // 4) + 1200 
     
     allowed, wait_sec = await rate_limiter.allow_request(
         provider="groq", api_key_hash=api_key_hash, 
-        token_cost=token_estimate, model=settings.GROQ_DRAFTING_MODEL
+        token_cost=token_estimate, model=safe_model # 🚨 Applied here
     )
     if not allowed:
         raise TimeoutError(f"Groq rate limited. Backing off for {wait_sec:.1f}s")
     
     try:
         response = await client.chat.completions.create(
-            model=settings.GROQ_DRAFTING_MODEL,
+            model=safe_model, # 🚨 Applied here
             messages=[
                 {"role": "system", "content": "You are a legal AI. Always output valid JSON."},
                 {"role": "user", "content": prompt}
             ],
-            response_format={"type": "json_object"}, # 🚨 Safe JSON enforcement
+            response_format={"type": "json_object"},
             temperature=0.1, 
-            max_tokens=4000 # 🚨 Prevents JSON truncation
+            max_tokens=4000
         )
         
-        content = response.choices[0].message.content.strip()
+        raw_content = response.choices[0].message.content
+        if not raw_content:
+            raise ValueError("Groq returned empty response (Possible safety block).")
+            
+        content = raw_content.strip()
         result = DraftedEmailSchema.model_validate_json(content)
         return result.model_dump()
         
     except ValidationError as e:
         logger.error(f"Groq output validation failed: {e}")
         raise ValueError(f"Invalid draft format: {e}")
-
+    except Exception as e:
+        logger.exception(f"Groq API call failed: {e}")
+        raise
 # ---------------------------------------------------------
 # 6. OUTPUT SANITIZATION (Semantic HTML Layout)
 # ---------------------------------------------------------
@@ -231,7 +250,6 @@ REQUESTED ACTION:
 
 {draft['signature_block']}"""
 
-    # 🚨 Semantic HTML styling for mobile-responsive email clients
     full_html = f"""
     <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 800px;">
         <p>{draft['salutation']}</p>
@@ -257,18 +275,23 @@ REQUESTED ACTION:
     }
 
 # ---------------------------------------------------------
-# 7. THE GRAPH NODE
+# 7. THE GRAPH NODE (UI Synced & Amnesia Patched)
 # ---------------------------------------------------------
 async def drafting_node(state: CivicLinkState, config: RunnableConfig) -> dict:
     citizen_text = state.get("extracted_text", "")
     jurisdiction = state.get("jurisdiction_hierarchy", {})
     contact = state.get("primary_contact", {})
     severity = state.get("severity_level", "MEDIUM")
-    issue_category = state.get("issue_category", "general")
+    
+    # 🚨 FIX: Extract issue category directly from the jurisdiction dictionary
+    issue_category = jurisdiction.get("issueCategory", "general")
     execution_ts = datetime.now(timezone.utc)
+    
+    existing_metrics = state.get("confidence_metrics", {})
     
     if not citizen_text.strip() or not jurisdiction.get("district"):
         return {
+            "current_status": "AWAITING_REVIEW", 
             "error_log": [{"node": "drafting", "action": "missing_required_data", "ts": execution_ts.isoformat()}],
             "status_updates": [{"node": "drafting", "action": "skipped", "ts": execution_ts.isoformat()}]
         }
@@ -288,15 +311,16 @@ async def drafting_node(state: CivicLinkState, config: RunnableConfig) -> dict:
             email_content = _sanitize_for_dispatch(draft)
             
             return {
+                "current_status": "AWAITING_REVIEW", 
                 "drafted_letter": {
                     "subject": email_content["subject"],
                     "body": email_content["body_text"],
                     "body_html": email_content["body_html"],
                     "language": email_content["language"],
-                    "citations_included": str(len(citations)), # 🚨 Strict Dict[str, str] casting
+                    "citations_included": str(len(citations)),
                     "generated_at": execution_ts.isoformat()
                 },
-                "confidence_metrics": {"drafting_quality": 0.95},
+                "confidence_metrics": {**existing_metrics, "drafting_quality": 0.95}, 
                 "status_updates": [{
                     "node": "drafting",
                     "action": "draft_generated",
@@ -311,6 +335,7 @@ async def drafting_node(state: CivicLinkState, config: RunnableConfig) -> dict:
             logger.exception(f"Drafting node critical failure: {e}")
             span.record_exception(e)
             return {
+                "current_status": "FAILED", 
                 "error_log": [{"node": "drafting", "action": "critical_failure", "details": type(e).__name__, "ts": execution_ts.isoformat()}],
                 "status_updates": [{"node": "drafting", "action": "failed_safe", "ts": execution_ts.isoformat()}]
             }

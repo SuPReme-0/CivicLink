@@ -2,6 +2,7 @@
 'use client';
 
 import { useState, useEffect } from 'react';
+import Link from 'next/link';
 import { motion } from 'framer-motion';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { 
@@ -15,8 +16,7 @@ import {
 } from 'recharts';
 import toast from 'react-hot-toast';
 
-import { apiClient } from '@/lib/api-client';
-import { cn, formatRelativeTime } from '@/lib/utils';
+import { cn } from '@/lib/utils';
 import { useRealTime } from './layout';
 import { MetricCard } from './components/MetricCard';
 import { StatusBadge } from './components/StatusBadge';
@@ -24,9 +24,40 @@ import { GraphVisualizer } from './components/GraphVisualizer';
 import type { GrievanceCase, GrievanceStatus } from '@/types';
 
 // =============================================================================
+// 🚨 SECURE FETCH WRAPPER (Bypasses Next.js Proxy & IPv6 Bugs)
+// =============================================================================
+const getBaseUrl = () => {
+  const url = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
+  return url.replace('localhost', '127.0.0.1'); // Force IPv4 to prevent ECONNREFUSED
+};
+
+const secureAdminFetch = async (endpoint: string) => {
+  const res = await fetch(`${getBaseUrl()}/api/v1/admin/${endpoint}`, {
+    headers: {
+      'X-Frontend-API-Key': process.env.NEXT_PUBLIC_FRONTEND_API_KEY || 'dev-key-12345',
+      'Authorization': `Bearer ${process.env.NEXT_PUBLIC_FRONTEND_API_KEY || 'dev-key-12345'}`
+    },
+    cache: 'no-store'
+  });
+  if (!res.ok) throw new Error(`Fetch failed: ${res.statusText}`);
+  return res.json();
+};
+
+const secureAdminAction = async (endpoint: string, method: string = 'POST') => {
+  const res = await fetch(`${getBaseUrl()}/api/v1/admin/${endpoint}`, {
+    method,
+    headers: {
+      'X-Frontend-API-Key': process.env.NEXT_PUBLIC_FRONTEND_API_KEY || 'dev-key-12345',
+      'Authorization': `Bearer ${process.env.NEXT_PUBLIC_FRONTEND_API_KEY || 'dev-key-12345'}`
+    }
+  });
+  if (!res.ok) throw new Error(`Action failed: ${res.statusText}`);
+  return res.json();
+};
+
+// =============================================================================
 // CHART COMPONENTS (Hydration Safe)
 // =============================================================================
-
 function ThroughputChart({ data }: { data: any[] }) {
   const [isMounted, setIsMounted] = useState(false);
   useEffect(() => setIsMounted(true), []);
@@ -88,26 +119,24 @@ function StatusPieChart({ data }: { data: any[] }) {
 // =============================================================================
 // RECENT GRIEVANCES WIDGET
 // =============================================================================
-
 function RecentGrievances() {
-  const { data: grievancesResponse, isLoading, refetch, isFetching } = useQuery({
+  const { data, isLoading, refetch, isFetching } = useQuery({
     queryKey: ['admin', 'grievances', 'dashboard'],
-    // 🚨 FIXED: This endpoint now returns { items: [] }
-    queryFn: () => apiClient.fetchGrievances({ pageSize: 5 }), 
+    queryFn: () => secureAdminFetch('grievances?limit=5'), 
     refetchInterval: 30000
   });
   
   const queryClient = useQueryClient();
   const { subscribe } = useRealTime();
 
-  const items = grievancesResponse?.items || [];
+  const items = data?.items || data || [];
 
   useEffect(() => {
     if (!items.length) return;
     const subs = items.map((g: GrievanceCase) => subscribe(g.trackingId, () => {
       queryClient.invalidateQueries({ queryKey: ['admin', 'grievances', 'dashboard'] });
     }));
-    return () => subs.forEach(unsub => unsub());
+    return () => subs.forEach((unsub: () => void) => unsub());
   }, [items, subscribe, queryClient]);
 
   return (
@@ -125,29 +154,34 @@ function RecentGrievances() {
       <div className="space-y-3">
         {isLoading ? Array.from({ length: 5 }).map((_, i) => (
           <div key={i} className="p-3 animate-pulse"><div className="h-12 bg-white/5 rounded-lg" /></div>
-        )) : items.map((g: GrievanceCase) => (
-          // 🚨 FIXED: Object Mapping Crash resolved.
-          <motion.a
-            key={g.id}
-            href={`/admin/review/${g.trackingId}`}
-            initial={{ opacity: 0, y: 10 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="flex items-center justify-between p-3 glass-panel rounded-xl hover:bg-white/5 transition-colors cursor-pointer group"
-          >
-            <div className="flex items-center gap-3 min-w-0">
-              <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-indigo-500/20 to-purple-500/20 flex items-center justify-center flex-shrink-0">
-                <FileText className="w-5 h-5 text-indigo-400" />
+        )) : items.length > 0 ? items.map((g: GrievanceCase) => (
+          <Link key={g.id} href={`/admin/review/${g.trackingId}`} className="block group">
+            <motion.div
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="flex items-center justify-between p-3 glass-panel rounded-xl group-hover:bg-white/5 transition-colors cursor-pointer"
+            >
+              <div className="flex items-center gap-3 min-w-0">
+                <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-indigo-500/20 to-purple-500/20 flex items-center justify-center flex-shrink-0">
+                  <FileText className="w-5 h-5 text-indigo-400" />
+                </div>
+                <div className="min-w-0">
+                  <p className="font-mono text-sm text-[var(--primary)] truncate">{g.trackingId}</p>
+                  <p className="text-xs text-white/60 truncate capitalize">{g.issueCategory?.replace(/_/g, ' ') || 'Triage'} • {g.systemMetadata?.jurisdiction?.district || 'Routing...'}</p>
+                </div>
               </div>
-              <div className="min-w-0">
-                <p className="font-mono text-sm text-[var(--primary)] truncate">{g.trackingId}</p>
-                <p className="text-xs text-white/60 truncate capitalize">{g.issueCategory.replace(/_/g, ' ')} • {g.systemMetadata?.jurisdiction?.district || 'Routing...'}</p>
-              </div>
-            </div>
-            <StatusBadge status={g.status} size="sm" />
-          </motion.a>
-        ))}
+              <StatusBadge status={g.status} size="sm" />
+            </motion.div>
+          </Link>
+        )) : (
+          <div className="text-center py-8 text-white/50 text-sm font-mono border border-dashed border-white/10 rounded-xl">
+            Queue is clear.
+          </div>
+        )}
       </div>
-      <a href="/admin/grievances" className="block mt-4 text-center text-sm text-[var(--admin-accent)] hover:underline">View all grievances →</a>
+      <Link href="/admin/grievances" className="block mt-4 text-center text-sm text-[var(--admin-accent)] hover:underline">
+        View all grievances →
+      </Link>
     </div>
   );
 }
@@ -155,12 +189,10 @@ function RecentGrievances() {
 // =============================================================================
 // SYSTEM HEALTH & HITL WIDGETS
 // =============================================================================
-
 function SystemHealth() {
-  // 🚨 FIXED: Real API Integration
   const { data: health, isLoading } = useQuery({
     queryKey: ['admin', 'system-health'],
-    queryFn: () => apiClient.fetchSystemHealth(),
+    queryFn: () => secureAdminFetch('health'),
     refetchInterval: 60000,
   });
 
@@ -173,7 +205,7 @@ function SystemHealth() {
 
   const services = health ? Object.keys(health).map(key => ({
     name: key.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
-    status: health[key].status || 'operational'
+    status: health[key].status || health[key] || 'operational'
   })) : defaultServices;
   
   return (
@@ -202,21 +234,22 @@ function SystemHealth() {
 }
 
 function PendingReviews() {
-  const { data: pending, isLoading } = useQuery({ 
+  const { data, isLoading } = useQuery({ 
     queryKey: ['admin', 'pending'], 
-    queryFn: () => apiClient.fetchPendingReviews(), 
+    queryFn: () => secureAdminFetch('pending'), 
     refetchInterval: 10000 
   });
   
   const queryClient = useQueryClient();
+  const pending = data?.items || data || [];
 
   const handleAction = async (id: string, action: 'approve' | 'reject') => {
     try {
-      await (action === 'approve' ? apiClient.approveGrievance(id) : apiClient.rejectGrievance(id, 'Admin action'));
-      toast.success(`Grievance ${action}d`);
+      await secureAdminAction(`grievances/${id}/${action}`, 'POST');
+      toast.success(`Grievance ${action}d successfully`);
       queryClient.invalidateQueries({ queryKey: ['admin', 'pending'] });
     } catch (e) { 
-      toast.error('Action failed'); 
+      toast.error('Action failed. Check connection.'); 
     }
   };
 
@@ -224,17 +257,17 @@ function PendingReviews() {
     <div className="glass-panel rounded-2xl p-6">
       <div className="flex items-center justify-between mb-4">
         <h3 className="text-lg font-semibold">Pending HITL</h3>
-        <span className="px-2 py-0.5 text-xs font-medium bg-orange-500/20 text-orange-300 rounded-full">{pending?.length || 0}</span>
+        <span className="px-2 py-0.5 text-xs font-medium bg-orange-500/20 text-orange-300 rounded-full">{pending.length || 0}</span>
       </div>
       <div className="space-y-3">
         {isLoading ? (
           <div className="h-32 bg-white/5 rounded-lg animate-pulse" />
-        ) : pending?.slice(0, 3).map(g => (
+        ) : pending.length > 0 ? pending.slice(0, 3).map((g: any) => (
           <div key={g.id} className="p-3 glass-panel rounded-xl">
             <div className="flex justify-between items-start mb-2">
               <div>
-                <p className="text-sm font-medium font-mono">{g.trackingId.slice(0, 8)}...</p>
-                <p className="text-xs text-white/50 line-clamp-1">{g.descriptionText}</p>
+                <p className="text-sm font-medium font-mono">{g.trackingId?.slice(0, 8)}...</p>
+                <p className="text-xs text-white/50 line-clamp-1">{g.descriptionText || 'Awaiting Review'}</p>
               </div>
               <StatusBadge status={g.status as GrievanceStatus} size="sm" showPulse />
             </div>
@@ -243,9 +276,15 @@ function PendingReviews() {
               <button onClick={() => handleAction(g.trackingId, 'reject')} className="flex-1 py-1.5 text-xs font-medium bg-red-500/20 text-red-300 rounded hover:bg-red-500/30 transition-colors">Reject</button>
             </div>
           </div>
-        )) || <div className="text-center py-6 text-white/50 text-sm">No pending reviews</div>}
+        )) : (
+          <div className="text-center py-6 text-white/50 text-sm font-mono border border-dashed border-white/10 rounded-xl">
+            No pending reviews
+          </div>
+        )}
       </div>
-      <a href="/admin/grievances?status=AWAITING_REVIEW" className="block mt-4 text-center text-sm text-[var(--admin-accent)] hover:underline">Review queue →</a>
+      <Link href="/admin/grievances?status=AWAITING_REVIEW" className="block mt-4 text-center text-sm text-[var(--admin-accent)] hover:underline">
+        Review queue →
+      </Link>
     </div>
   );
 }
@@ -253,14 +292,12 @@ function PendingReviews() {
 // =============================================================================
 // MAIN DASHBOARD PAGE
 // =============================================================================
-
 export default function AdminDashboard() {
-  const { isConnected, lastUpdate } = useRealTime();
+  const { isConnected } = useRealTime();
   
-  // 🚨 FIXED: Real API Fetching for Main Dashboard Stats
   const { data: stats, isLoading: statsLoading, refetch: refetchStats, isFetching } = useQuery({
     queryKey: ['admin', 'dashboard-stats'],
-    queryFn: () => apiClient.fetchDashboardStats(),
+    queryFn: () => secureAdminFetch('stats'),
     refetchInterval: 15000,
   });
 
@@ -303,8 +340,8 @@ export default function AdminDashboard() {
       {/* Metrics */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <MetricCard title="Total Grievances" value={metrics.total.toLocaleString()} loading={statsLoading} icon={FileText} trend="up" />
-        <MetricCard title="Active Cases" value={metrics.active} loading={statsLoading} icon={Clock} trend="stable" />
-        <MetricCard title="Resolved Today" value={metrics.resolved} loading={statsLoading} icon={CheckCircle} trend="up" />
+        <MetricCard title="Active Cases" value={metrics.active.toLocaleString()} loading={statsLoading} icon={Clock} trend="stable" />
+        <MetricCard title="Resolved Today" value={metrics.resolved.toLocaleString()} loading={statsLoading} icon={CheckCircle} trend="up" />
         <MetricCard title="Avg Resolution" value={metrics.avgTime} loading={statsLoading} icon={TrendingUp} trend="up" />
       </div>
 
@@ -326,11 +363,16 @@ export default function AdminDashboard() {
           <div className="glass-panel rounded-2xl p-6">
             <h3 className="text-lg font-semibold mb-4">Quick Actions</h3>
             <div className="grid grid-cols-2 gap-3">
-              {[{l:'Broadcast', i: Bell, href: '#'}, {l:'Export Report', i: FileText, href: '#'}, {l:'Users', i: Users, href: '/admin/users'}, {l:'Audit', i: Activity, href: '/admin/audit'}].map(a => (
-                <a key={a.l} href={a.href} className="flex flex-col items-center gap-2 p-4 glass-panel rounded-xl hover:bg-white/5 transition-colors text-center">
+              {[
+                {l:'Broadcast', i: Bell, href: '#'}, 
+                {l:'Export Report', i: FileText, href: '#'}, 
+                {l:'Users', i: Users, href: '/admin/users'}, 
+                {l:'Audit', i: Activity, href: '/admin/audit'}
+              ].map(a => (
+                <Link key={a.l} href={a.href} className="flex flex-col items-center gap-2 p-4 glass-panel rounded-xl hover:bg-white/5 transition-colors text-center">
                   <a.i className="w-5 h-5 text-[var(--admin-accent)]" />
                   <span className="text-xs font-medium">{a.l}</span>
-                </a>
+                </Link>
               ))}
             </div>
           </div>
@@ -347,9 +389,9 @@ export default function AdminDashboard() {
             </h3>
             <p className="text-sm text-white/60 mt-1">Real-time LangGraph execution for active grievances</p>
           </div>
-          <a href="/admin/review/demo-thread-123" className="text-sm text-[var(--admin-accent)] hover:underline flex items-center gap-1">
+          <Link href="/admin/review/demo-thread-123" className="text-sm text-[var(--admin-accent)] hover:underline flex items-center gap-1">
             Open Full View <ArrowUpRight className="w-4 h-4" />
-          </a>
+          </Link>
         </div>
         <div className="h-80">
           <GraphVisualizer threadId="demo-thread-123" isPreview={true} onNodeClick={() => {}} />

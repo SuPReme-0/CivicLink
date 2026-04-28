@@ -5,11 +5,12 @@ Production Multi-Provider VLM Abstraction with LangGraph Integration.
 - Real health checks with configurable timeouts
 - Unified error handling + safety filter support
 - Per-thread rate limiting via RunnableConfig propagation
-- SDK-compliant parameter handling (Gemini GenerationConfig, Groq vision format)
+- SDK-compliant parameter handling (Gemini Blobs, Groq/OpenAI URLs)
 """
 import json
 import logging
 import asyncio
+import base64 # 🚨 FIX: Added base64 import
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timezone, timedelta
 from abc import ABC, abstractmethod
@@ -50,9 +51,10 @@ FORENSIC_SCHEMA = {
         "copy_move_detected": {"type": "boolean"},
         "severity": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"]},
         "confidence_score": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-        "rationale": {"type": "string"}
+        "rationale": {"type": "string"},
+        "image_description": {"type": "string"} # 🚨 ADDED: Acts as the eyes for Groq
     },
-    "required": ["is_genuine", "confidence_score", "severity", "rationale"],
+    "required": ["is_genuine", "confidence_score", "severity", "rationale", "image_description"],
     "additionalProperties": False
 }
 
@@ -61,7 +63,7 @@ def _sanitize_context(text: str) -> str:
     return "".join(c for c in text if c.isprintable() or c in "\n\t")[:500].replace('"', '\\"')
 
 # ---------------------------------------------------------
-# 2. ABSTRACT BASE PROVIDER (Fixed Signature)
+# 2. ABSTRACT BASE PROVIDER
 # ---------------------------------------------------------
 class VLMProvider(ABC):
     """Abstract base for VLM providers with LangGraph integration."""
@@ -70,10 +72,6 @@ class VLMProvider(ABC):
     SUPPORTS_VISION: bool = True
     
     def __init__(self, provider_name: str, model: str, api_key: str):
-        """
-        Initialize provider with explicit name propagation.
-        Fixes Bug #3: Ensures provider_name is always set correctly.
-        """
         self.provider_name = provider_name
         self.model = model
         self.api_key = api_key
@@ -91,7 +89,7 @@ class VLMProvider(ABC):
     async def check_health(self) -> bool:
         """Real lightweight health check via API ping with configurable timeout."""
         start = datetime.now(timezone.utc)
-        timeout = getattr(settings, "PROVIDER_HEALTH_TIMEOUT", 3.0)  # Fix #5: Use settings
+        timeout = getattr(settings, "PROVIDER_HEALTH_TIMEOUT", 15.0)
         try:
             healthy = await asyncio.wait_for(self._ping_api(), timeout=timeout)
             latency = (datetime.now(timezone.utc) - start).total_seconds() * 1000
@@ -120,12 +118,11 @@ class VLMProvider(ABC):
     
     @abstractmethod
     async def _ping_api(self) -> bool:
-        """Provider-specific lightweight ping implementation."""
         pass
     
     def _calculate_cost(self, tokens: int) -> float:
         key = f"{self.provider_name}/{self.model}"
-        rate = settings.COST_PER_1K_TOKENS.get(key, 0.0)
+        rate = getattr(settings, "COST_PER_1K_TOKENS", 0.0)
         return (tokens / 1000) * rate
     
     async def _check_rate_limit(self, token_estimate: int, config: Optional[RunnableConfig] = None) -> tuple[bool, float]:
@@ -141,7 +138,7 @@ class VLMProvider(ABC):
         )
     
     async def _record_usage(self, token_cost: int, cost_usd: float, config: Optional[RunnableConfig] = None):
-        if not settings.ENABLE_COST_TRACKING:
+        if not getattr(settings, "ENABLE_COST_TRACKING", False):
             return
         configurable = config.get("configurable", {}) if config else {}
         thread_id = configurable.get("thread_id", "default")
@@ -176,15 +173,14 @@ class VLMProvider(ABC):
         )
 
 # ---------------------------------------------------------
-# 3. GROQ PROVIDER (Vision-Capable, Fixed Format)
+# 3. GROQ PROVIDER
 # ---------------------------------------------------------
 class GroqProvider(VLMProvider):
     PROVIDER_NAME = "groq"
     SUPPORTS_VISION = True
-    VISION_MODEL = "llama-3.2-90b-vision-preview"
+    VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
     
     def __init__(self, api_key: str):
-        # Fix #3: Explicit provider_name propagation
         super().__init__("groq", self.VISION_MODEL, api_key)
         self.client: Optional[AsyncGroq] = None
     
@@ -192,14 +188,15 @@ class GroqProvider(VLMProvider):
         if not self.client:
             self.client = AsyncGroq(
                 api_key=self.api_key,
-                timeout=settings.FALLBACK_TIMEOUT_SECONDS,
+                # 🚨 FIX: Safe fallback
+                timeout=getattr(settings, "FALLBACK_TIMEOUT_SECONDS", 60.0), 
                 max_retries=2
             )
             self._initialized = True
     
     async def _ping_api(self) -> bool:
         await self._ensure_client()
-        timeout = getattr(settings, "PROVIDER_HEALTH_TIMEOUT", 3.0)
+        timeout = getattr(settings, "PROVIDER_HEALTH_TIMEOUT", 15.0)
         try:
             await asyncio.wait_for(self.client.models.list(), timeout=timeout)
             return True
@@ -210,7 +207,6 @@ class GroqProvider(VLMProvider):
         await self._ensure_client()
         safe_context = _sanitize_context(context)
         
-        # Fix #2: JSON enforced via prompt ONLY (no response_format with vision)
         prompt = f"""
         Forensic image analysis. Citizen claim: "{safe_context}"
         Analyze the linked image for authenticity.
@@ -225,7 +221,7 @@ class GroqProvider(VLMProvider):
             raise TimeoutError(f"{self.provider_name} rate limited. Wait {wait_sec:.1f}s")
         
         try:
-            # Fix #2: Add detail parameter + remove response_format for vision compatibility
+            # Groq & OpenAI natively support data:image/jpeg;base64,... strings in URL dicts
             response = await self.client.chat.completions.create(
                 model=self.model,
                 messages=[{
@@ -235,13 +231,11 @@ class GroqProvider(VLMProvider):
                         {"type": "image_url", "image_url": {"url": image_url, "detail": "auto"}}
                     ]
                 }],
-                # response_format REMOVED for vision model compatibility
                 temperature=0.1,
                 max_tokens=300
             )
             
             content = response.choices[0].message.content.strip()
-            # Defensive markdown stripping
             if content.startswith("```json"):
                 content = content[7:-3].strip()
             elif content.startswith("```"):
@@ -249,7 +243,6 @@ class GroqProvider(VLMProvider):
             
             result = json.loads(content)
             
-            # Validate schema compliance
             for field in FORENSIC_SCHEMA["required"]:
                 if field not in result:
                     raise ValueError(f"Missing required field: {field}")
@@ -270,7 +263,7 @@ class GroqProvider(VLMProvider):
         return 450
 
 # ---------------------------------------------------------
-# 4. GEMINI PROVIDER (Fixed GenerationConfig + Safety)
+# 4. GEMINI PROVIDER (🚨 FIXED FOR BASE64 PAYLOADS)
 # ---------------------------------------------------------
 class GeminiProvider(VLMProvider):
     PROVIDER_NAME = "gemini"
@@ -286,9 +279,8 @@ class GeminiProvider(VLMProvider):
             self._initialized = True
     
     async def _ping_api(self) -> bool:
-        # Fix #1: Use simple model listing instead of generation call
         await self._ensure_client()
-        timeout = getattr(settings, "PROVIDER_HEALTH_TIMEOUT", 3.0)
+        timeout = getattr(settings, "PROVIDER_HEALTH_TIMEOUT", 15.0)
         try:
             await asyncio.wait_for(
                 asyncio.to_thread(genai.get_model, f"models/{self.model}"),
@@ -302,22 +294,58 @@ class GeminiProvider(VLMProvider):
         await self._ensure_client()
         safe_context = _sanitize_context(context)
         
-        # Fix #1: Use explicit GenerationConfig object instead of raw dict
         generation_config = genai_types.GenerationConfig(
             temperature=0.1,
             max_output_tokens=300,
             response_mime_type="application/json",
             response_schema=FORENSIC_SCHEMA,
         )
-        
+        # 🚨 FIX: Aggressively strip ALL JSON schema keywords that Google Protobuf rejects
+        def _sanitize_for_gemini(schema_node):
+            if not isinstance(schema_node, dict):
+                return schema_node
+            
+            clean_node = {}
+            # Google's strict parser ONLY allows: type, format, description, nullable, enum, properties, required, items
+            # It will instantly crash if it sees minimum, maximum, additionalProperties, title, default, etc.
+            unsupported_keys = {"additionalProperties", "minimum", "maximum", "title", "default"}
+            
+            for k, v in schema_node.items():
+                if k in unsupported_keys:
+                    continue
+                if isinstance(v, dict):
+                    clean_node[k] = _sanitize_for_gemini(v)
+                elif isinstance(v, list):
+                    clean_node[k] = [_sanitize_for_gemini(item) for item in v]
+                else:
+                    clean_node[k] = v
+            return clean_node
+
+        raw_schema = FORENSIC_SCHEMA.model_json_schema() if hasattr(FORENSIC_SCHEMA, "model_json_schema") else dict(FORENSIC_SCHEMA)
+        safe_schema = _sanitize_for_gemini(raw_schema)
+
         model = genai.GenerativeModel(
-            model_name=self.model,
-            generation_config=generation_config,
-            safety_settings=settings.GEMINI_SAFETY_SETTINGS
+            model_name="gemini-2.0-flash",
+            generation_config={
+                "temperature": 0.1,
+                "response_mime_type": "application/json",
+                "response_schema": safe_schema # 🚨 Pass the perfectly clean schema
+            },
+            safety_settings=getattr(settings, "GEMINI_SAFETY_SETTINGS", None)
         )
         
         prompt = f"Forensic analysis. Claim: {safe_context}. Output JSON only."
         
+        # 🚨 THE FIX: Convert the Base64 Data URI into a format Gemini can understand
+        vision_content = None
+        if image_url.startswith("data:image"):
+            header, encoded = image_url.split(",", 1)
+            mime_type = header.split(";")[0].replace("data:", "")
+            image_bytes = base64.b64decode(encoded)
+            vision_content = {"mime_type": mime_type, "data": image_bytes}
+        else:
+            raise ValueError("GeminiProvider requires a Base64 Data URI for image payloads.")
+
         token_estimate = await self.estimate_tokens(image_url, safe_context)
         allowed, wait_sec = await self._check_rate_limit(token_estimate, config)
         if not allowed:
@@ -325,11 +353,10 @@ class GeminiProvider(VLMProvider):
         
         try:
             response = await model.generate_content_async(
-                [prompt, {"image_url": image_url}],
+                [prompt, vision_content], # 🚨 Passes the exact dict structure Gemini needs
                 request_options={"timeout": settings.FALLBACK_TIMEOUT_SECONDS}
             )
             
-            # Handle safety-blocked responses
             if hasattr(response, 'prompt_feedback') and response.prompt_feedback.block_reason:
                 logger.warning(f"Gemini safety blocked: {response.prompt_feedback.block_reason}")
                 return {
@@ -342,7 +369,6 @@ class GeminiProvider(VLMProvider):
                     "rationale": f"safety_blocked:{response.prompt_feedback.block_reason.name}"
                 }
             
-            # Parse JSON response
             if hasattr(response, 'parsed') and isinstance(response.parsed, dict):
                 result = response.parsed
             elif response.text:
@@ -353,9 +379,9 @@ class GeminiProvider(VLMProvider):
             for field in FORENSIC_SCHEMA["required"]:
                 if field not in result:
                     raise ValueError(f"Missing required field: {field}")
-            
-            usage = getattr(response, 'usage_metadata', {})
-            tokens = usage.get('total_token_count', token_estimate)
+            # 🚨 FIX: Safely parse Gemini's usage object
+            usage = getattr(response, 'usage_metadata', None)
+            tokens = getattr(usage, 'total_token_count', token_estimate) if usage else token_estimate
             cost = self._calculate_cost(tokens)
             await self._record_usage(tokens, cost, config)
             
@@ -379,14 +405,13 @@ class GeminiProvider(VLMProvider):
         return 600
 
 # ---------------------------------------------------------
-# 5. VLLM PROVIDER (Fixed __init__ Signature)
+# 5. VLLM PROVIDER 
 # ---------------------------------------------------------
 class VLLMProvider(VLMProvider):
     PROVIDER_NAME = "vllm"
     SUPPORTS_VISION = True
     
     def __init__(self, model: str, api_key: str, base_url: str):
-        # Fix #3: Explicit provider_name propagation + local base_url storage
         super().__init__("vllm", model, api_key)
         self.base_url = base_url
         self.client: Optional[AsyncOpenAI] = None
@@ -396,14 +421,15 @@ class VLLMProvider(VLMProvider):
             self.client = AsyncOpenAI(
                 base_url=self.base_url,
                 api_key=self.api_key,
-                timeout=settings.VLLM_TIMEOUT,
+                # 🚨 FIX: Safe fallback
+                timeout=getattr(settings, "VLLM_TIMEOUT", 60.0), 
                 max_retries=2
             )
             self._initialized = True
     
     async def _ping_api(self) -> bool:
         await self._ensure_client()
-        timeout = getattr(settings, "PROVIDER_HEALTH_TIMEOUT", 3.0)
+        timeout = getattr(settings, "PROVIDER_HEALTH_TIMEOUT", 15.0)
         try:
             await asyncio.wait_for(self.client.models.list(), timeout=timeout)
             return True

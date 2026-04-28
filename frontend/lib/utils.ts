@@ -13,20 +13,19 @@ export function getEnv(key: string, fallback: string = ''): string {
 
 // --- DATE & TIME ---
 export function formatRelativeTime(date: Date | string): string {
-  const d = new Date(date);
   const now = new Date();
-  const diffMs = now.getTime() - d.getTime();
+  const then = new Date(date);
+  const diffMs = now.getTime() - then.getTime();
   const diffMins = Math.round(diffMs / 60000);
   
   if (diffMins < 1) return 'Just now';
   if (diffMins < 60) return `${diffMins}m ago`;
   const diffHrs = Math.round(diffMins / 60);
   if (diffHrs < 24) return `${diffHrs}h ago`;
-  
-  // Format as "Apr 25, 2026"
-  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  const diffDays = Math.round(diffHrs / 24);
+  if (diffDays < 7) return `${diffDays}d ago`;
+  return then.toLocaleDateString();
 }
-
 // --- CIVICLINK SPECIFIC UTILITIES ---
 
 /**
@@ -66,3 +65,4 @@ export function generateFrontendTrackingId(): string {
   const randomChars = Math.random().toString(36).substring(2, 7);
   return `TRK-${timestamp}-${randomChars}`.toUpperCase();
 }
+

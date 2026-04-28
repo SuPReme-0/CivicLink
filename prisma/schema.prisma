@@ -12,6 +12,7 @@ generator py_client {
 generator js_client {
   provider        = "prisma-client-js"
   previewFeatures = ["postgresqlExtensions"]
+  // Adjust this output path if necessary based on where you run prisma generate
   output          = "../frontend/node_modules/.prisma/client"
 }
 
@@ -25,10 +26,20 @@ datasource db {
 // GLOBAL ENUMS: Strict Type Safety
 // ─────────────────────────────────────────────────────────────
 
+// 🚨 UPGRADED: Matched to frontend RBAC exactly
 enum AdminRole {
   SUPER_ADMIN
-  MODERATOR
-  DATA_ENTRY
+  ADMIN
+  REVIEWER
+  AUDITOR
+  SUPPORT
+}
+
+// 🚨 ADDED: For User Management Dashboard
+enum AdminStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
 }
 
 enum SeverityLevel {
@@ -51,7 +62,6 @@ enum GrievanceStatus {
   REJECTED_FRAUD
   ESCALATED
   FAILED
-  
 }
 
 enum VerificationStatus {
@@ -113,25 +123,28 @@ model WebhookEvent {
 // ─────────────────────────────────────────────────────────────
 
 model AdminUser {
-  id                      String   @id @default(cuid())
-  email                   String   @unique
+  id                      String      @id @default(cuid())
+  name                    String      // 🚨 ADDED
+  email                   String      @unique
   passwordHash            String
   
   // Security Protocols
-  mfaEnabled              Boolean  @default(false)
-  mfaSecret               String?  // Encrypted TOTP Secret
-  failedLoginAttempts     Int      @default(0)
+  mfaEnabled              Boolean     @default(false)
+  mfaSecret               String?     // Encrypted TOTP Secret
+  failedLoginAttempts     Int         @default(0)
   lastLoginAt             DateTime?
   accountLockedUntil      DateTime?
 
-  role                    AdminRole @default(MODERATOR)
+  role                    AdminRole   @default(REVIEWER) // 🚨 UPGRADED
+  status                  AdminStatus @default(ACTIVE)   // 🚨 ADDED
   jurisdictionAccessState String?  
-  createdAt               DateTime  @default(now())
+  actionsCount            Int         @default(0)        // 🚨 ADDED
+  createdAt               DateTime    @default(now())
 
   // Relations
   reviewedGrievances      GrievanceCase[]
   overriddenContacts      AdministrativeHierarchy[]
-  securityLogs            SecurityAuditLog[] 
+  auditLogs               SystemAuditLog[]               // 🚨 UPGRADED
   sessions                AdminSession[]
   
   @@map("admin_users")
@@ -157,58 +170,100 @@ model AdminSession {
   @@map("admin_sessions")
 }
 
-model SecurityAuditLog {
-  id               String    @id @default(cuid())
-  adminId          String?   // 🚨 Nullable to prevent deletion crashes
-  action           String    // e.g., "OVERRODE_CONTACT", "REVOKED_SESSION"
-  
-  // Tamper-Evident Cryptographic Chain
-  previousHash     String?   @unique 
-  currentHash      String    @unique
-  
-  ipAddress        String?   // Hashed IP
-  userAgent        String?
-  targetResourceId String?   
-  timestamp        DateTime  @default(now())
+// 🚨 UPGRADED: Replacing SecurityAuditLog with SystemAuditLog to support the frontend Audit page
+model SystemAuditLog {
+  id            String   @id @default(cuid())
+  timestamp     DateTime @default(now())
+  actor         String   // E.g., "Priyanshu Roy" or "System Agent"
+  actorRole     String   // E.g., "SUPER_ADMIN"
+  action        String   // E.g., "LOGIN", "APPROVE", "ROLE_CHANGE"
+  severity      String   // E.g., "INFO", "SUCCESS", "WARNING", "CRITICAL"
+  target        String   // E.g., Tracking ID or System Resource
+  details       String   @db.Text
+  ip            String?
+  userAgent     String?
+  immutableHash String   @unique // Cryptographic seal
 
-  // 🚨 SetNull ensures immutable logs remain even if the admin is purged
-  admin            AdminUser? @relation(fields: [adminId], references: [id], onDelete: SetNull)
+  // Optional link to AdminUser (if action was performed by a human)
+  adminId       String?
+  admin         AdminUser? @relation(fields: [adminId], references: [id], onDelete: SetNull)
 
-  @@index([adminId, timestamp(sort: Desc)])
-  @@map("security_audit_logs")
+  @@index([timestamp(sort: Desc)])
+  @@map("system_audit_logs")
+}
+
+// 🚨 ADDED: Global System Settings Cache
+model SystemSetting {
+  id        String   @id @default("global") // Enforce single row
+  config    Json     // Contains { system: {}, ai: {}, features: {}, security: {} }
+  updatedAt DateTime @updatedAt
+
+  @@map("system_settings")
 }
 
 // ─────────────────────────────────────────────────────────────
 // 3. CITIZEN CRYPTOGRAPHY & ANONYMIZATION
 // ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// 3. CITIZEN CRYPTOGRAPHY & WEB AUTHENTICATION
+// ─────────────────────────────────────────────────────────────
 
 model Citizen {
   id               String         @id @default(cuid())
-  whatsappId       String         @unique 
   
-  // Cryptographic Blind Indexing
-  phoneHash        String         @unique // O(1) Lookups
-  encryptedPhone   String         @db.Text// AES-256-GCM ciphertext
+  // 🚨 ADDED: Web Portal Credentials (Nullable for WhatsApp-only users)
+  username         String?        @unique 
+  passwordHash     String?
+  lastWebLoginAt   DateTime?
+
+  // Omnichannel Identifiers
+  whatsappId       String?        @unique // Nullable for Web-only users
+  
+  // Cryptographic Blind Indexing (The ultimate identity anchor)
+  phoneHash        String         @unique 
+  encryptedPhone   String         @db.Text
   encryptedName    String?        @db.Text
-  encryptionKeyVer String         @default("v1") // KMS Key Rotation
+  encryptionKeyVer String         @default("v1") 
   
   // Automated Abuse Prevention
   trustScore       Float          @default(1.0)
-  isRateLimitedUntil DateTime?    
+  isRateLimitedUntil DateTime?  
   
   languagePref     String         @default("en")
   isBanned         Boolean        @default(false)
   
   // Compliance / Right to be Forgotten
-  anonymizedAt     DateTime?      
+  anonymizedAt     DateTime?    
   createdAt        DateTime       @default(now())
 
+  // Relations
   locations        UserLocation[]
   threads          GrievanceThread[]
   grievances       GrievanceCase[]
+  sessions         CitizenSession[] // 🚨 ADDED: Tracks web portal logins
 
   @@index([trustScore])
   @@map("citizens")
+}
+
+// 🚨 ADDED: Secure Session Management for Citizens
+model CitizenSession {
+  id               String    @id @default(cuid())
+  citizenId        String
+  
+  sessionTokenHash String    @unique // Hashed token, never plaintext
+  ipAddress        String?
+  userAgent        String?
+  
+  isRevoked        Boolean   @default(false)
+  expiresAt        DateTime
+  createdAt        DateTime  @default(now())
+  lastActiveAt     DateTime  @default(now())
+
+  citizen          Citizen   @relation(fields: [citizenId], references: [id], onDelete: Cascade)
+
+  @@index([citizenId, isRevoked])
+  @@map("citizen_sessions")
 }
 
 model UserLocation {
@@ -265,6 +320,11 @@ model AdministrativeHierarchy {
   embedding             Unsupported("vector(384)")?
   searchContext         String?            @db.Text // Raw string used for vector generation
 
+  bboxMinLat            Float?
+  bboxMaxLat            Float?
+  bboxMinLon            Float?
+  bboxMaxLon            Float?
+  
   // Escalation Tree (Self-Referencing)
   escalationContactId   String?            
   escalationContact     AdministrativeHierarchy?  @relation("EscalationTree", fields: [escalationContactId], references: [id])
@@ -303,7 +363,6 @@ model GrievanceThread {
   case             GrievanceCase?
   auditEvents      AuditEvent[]
 
-  // Note: Redundant @@index([threadId]) removed (handled by @unique)
   @@index([status, updatedAt(sort: Desc)])
   @@map("grievance_threads")
 }
@@ -341,7 +400,6 @@ model GrievanceCase {
   dispatchedTo         AdministrativeHierarchy? @relation(fields: [dispatchedToId], references: [id], onDelete: SetNull)
   
   citizen              Citizen         @relation(fields: [citizenId], references: [id], onDelete: Cascade)
-  // 🚨 Synced via references: [threadId] to directly map to the LangGraph native namespace
   thread               GrievanceThread @relation(fields: [threadId], references: [threadId], onDelete: Cascade)
   location             UserLocation?   @relation(fields: [locationId], references: [id], onDelete: SetNull)
   
@@ -349,7 +407,6 @@ model GrievanceCase {
   dispatchRecords      DispatchRecord[]
   auditEvents          AuditEvent[]
 
-  // Note: Redundant @@index([trackingId]) removed (handled by @unique)
   @@index([status, severity])
   @@map("grievance_cases")
 }
@@ -393,7 +450,7 @@ model ImageEvidence {
 model DispatchRecord {
   id               String          @id @default(cuid())
   grievanceId      String
-  contactId        String?         // 🚨 Changed to Nullable
+  contactId        String?         
   
   channel          DispatchChannel
   status           DispatchStatus  @default(QUEUED)
@@ -411,7 +468,6 @@ model DispatchRecord {
   completedAt      DateTime?
 
   grievance        GrievanceCase   @relation(fields: [grievanceId], references: [id], onDelete: Cascade)
-  // 🚨 Added SetNull so clearing the scraper cache doesn't orphan dispatch records
   contact          AdministrativeHierarchy? @relation(fields: [contactId], references: [id], onDelete: SetNull)
 
   @@index([status]) 

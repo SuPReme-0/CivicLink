@@ -1,40 +1,46 @@
-// app/(customer)/page.tsx
+// app/(customer)/dashboard/page.tsx
 'use client';
 
-import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
-import { motion, AnimatePresence, useScroll, useSpring } from 'framer-motion';
-import { useMutation } from '@tanstack/react-query';
+import { useState, useRef, useEffect, useCallback, Suspense } from 'react';
+import { useSearchParams, useRouter } from 'next/navigation';
+import { motion, AnimatePresence } from 'framer-motion';
+import { useMutation, useQuery } from '@tanstack/react-query';
 import { 
-  Send, Image as ImageIcon, Mic, MapPin, Check, CheckCheck, 
-  Loader2, AlertCircle, X, Map, ShieldCheck, FileText, Mail, User
+  Send, Image as ImageIcon, Mic, MapPin, CheckCheck, 
+  Loader2, X, ShieldCheck, Square, Fingerprint, 
+  Navigation2, Activity, Globe, Menu, Clock,
+  Plus, Crosshair, Cpu, CheckCircle2, ChevronRight, LogOut, User
 } from 'lucide-react';
 import toast, { Toaster } from 'react-hot-toast';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 
 import { apiClient } from '@/lib/api-client';
 import { cn } from '@/lib/utils';
-import type { IngestPayload, IngestResponse, GrievanceStatus, LocationData } from '@/types';
+import type { IngestPayload, LocationData, GrievanceStatus } from '@/types';
 
 // =============================================================================
-// TYPES & CONSTANTS
+// 🗺️ LEAFLET NATIVE CSS (Bypasses SSR Issues)
 // =============================================================================
+// @ts-ignore
+import 'leaflet/dist/leaflet.css';
+
+// =============================================================================
+// ⚙️ TYPES & CONSTANTS
+// =============================================================================
+const CHAT_STORAGE_KEY = 'civiclink_active_chat';
+const USER_STORAGE_KEY = 'civiclink_user_session';
 
 type Message = {
   id: string;
-  role: 'user' | 'system';
+  role: 'user' | 'system' | 'assistant';
   content: string;
   timestamp: Date;
-  status?: 'sending' | 'sent' | 'delivered' | 'read' | 'processing' | 'error';
+  status?: 'sending' | 'sent' | 'delivered' | 'processing' | 'error';
   attachment?: {
     type: 'image' | 'voice' | 'location';
-    url?: string;
     preview?: string;
     location?: LocationData;
-  };
-  metadata?: {
-    authScore?: number;
-    issueCategory?: string;
-    officialEmail?: string;
-    draftedContent?: string;
   };
 };
 
@@ -42,992 +48,739 @@ type ChatState = {
   messages: Message[];
   isTyping: boolean;
   trackingId?: string;
-  currentStatus?: GrievanceStatus;
-  location?: LocationData;
-  lastUpdatedAt?: string;
+  currentStatus?: GrievanceStatus | 'PENDING_DETAILS' | 'SYNCING_TELEMETRY'; 
 };
 
 const INITIAL_MESSAGE: Message = {
   id: 'welcome',
-  role: 'system',
-  content: "👋 Hello! I'm CivicLink Assistant. Send me a message, photo, or voice note about any civic issue. I'll verify, route, and dispatch it to the right official—securely and instantly.",
+  role: 'assistant',
+  content: "Welcome to CivicLink Core. I am your secure municipal intake agent. Please detail the issue you are reporting. Attaching a photo or tagging your location significantly accelerates our verification and dispatch process.",
   timestamp: new Date(),
   status: 'delivered'
 };
 
-// Conversational status messages (more natural than robotic status labels)
-const CONVERSATIONAL_MESSAGES: Partial<Record<GrievanceStatus, string>> = {
-  RECEIVED: "✅ Received your grievance. Starting verification process...",
-  VERIFYING_IMAGE: "🔍 Analyzing image authenticity using AI forensics...",
-  ROUTING_JURISDICTION: "📍 Pinpointing the responsible government jurisdiction...",
-  DISCOVERING_CONTACT: "👔 Finding the correct official's verified contact information...",
-  DRAFTING_LETTER: "✍️ Drafting formal legal complaint with municipal bylaws...",
-  AWAITING_REVIEW: "⏳ Final verification before secure dispatch...",
-  DISPATCHING: "📤 Digitally signing and dispatching to official...",
-  DISPATCHED: "🎉 Successfully dispatched! I'll monitor for a reply.",
-  FAILED: "⚠️ Something went wrong. Please try again or contact support.",
-  RESOLVED: "✅ The official has marked this issue as resolved. Thank you for your patience!",
-  REJECTED_FRAUD: "🚫 Submission flagged for manual review. Please contact support if this is an error.",
-  ESCALATED: "⬆️ Escalated to higher authority for urgent attention."
+const PIPELINE_STATUS_MESSAGES: Record<string, string> = {
+  PENDING_DETAILS: "Awaiting Case Details...",
+  SYNCING_TELEMETRY: "Restoring Pipeline Data...",
+  RECEIVED: "Payload Secured. Pipeline Initiated.",
+  VERIFYING_IMAGE: "Running Vision-Language Forensics...",
+  ROUTING_JURISDICTION: "Calculating Geo-Jurisdiction...",
+  DISCOVERING_CONTACT: "Querying Department Matrix...",
+  DRAFTING_LETTER: "Compiling Legal Directive...",
+  AWAITING_REVIEW: "Awaiting Human Verification...",
+  DISPATCHING: "Executing Secure DKIM Dispatch...",
+  DISPATCHED: "Mission Success. Payload Dispatched.",
+  RESOLVED: "Case Marked as Resolved.",
+  FAILED: "Pipeline Fault Detected."
 };
 
-const DEFAULT_STATUS_MESSAGE = "🔄 Processing your grievance...";
+const staggerContainer = { hidden: { opacity: 0 }, show: { opacity: 1, transition: { staggerChildren: 0.05 } } };
+const fadeInUp = { hidden: { opacity: 0, y: 15, scale: 0.98 }, show: { opacity: 1, y: 0, scale: 1, transition: { type: "spring", stiffness: 300, damping: 24 } } };
 
 // =============================================================================
-// UTILITY HOOKS & COMPONENTS
+// 🗺️ NATIVE LEAFLET COMPONENT
 // =============================================================================
+function NativeMap({ position, setPosition }: { position: any, setPosition: any }) {
+  const mapContainer = useRef<HTMLDivElement>(null);
+  const mapInstance = useRef<any>(null);
+  const markerInstance = useRef<any>(null);
 
-// Client-only time for hydration-safe timestamps
-const useClientTime = () => {
-  const [now, setNow] = useState<Date>(new Date());
-  
   useEffect(() => {
-    const timer = setInterval(() => setNow(new Date()), 60000);
-    return () => clearInterval(timer);
+    if (typeof window === 'undefined') return;
+
+    if (!document.getElementById('leaflet-css')) {
+      const link = document.createElement('link');
+      link.id = 'leaflet-css';
+      link.rel = 'stylesheet';
+      link.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+      document.head.appendChild(link);
+    }
+
+    import('leaflet').then((L) => {
+      if (!mapContainer.current || mapInstance.current) return;
+
+      delete (L.Icon.Default.prototype as any)._getIconUrl;
+      L.Icon.Default.mergeOptions({
+        iconRetinaUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png',
+        iconUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',
+        shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
+      });
+
+      const initialPos: [number, number] = position ? [position.lat, position.lng] : [20.5937, 78.9629];
+      const zoom = position ? 16 : 4;
+      
+      mapInstance.current = L.map(mapContainer.current, { zoomControl: false }).setView(initialPos, zoom);
+      L.control.zoom({ position: 'bottomright' }).addTo(mapInstance.current);
+      
+      L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+        attribution: '&copy; OpenStreetMap & CartoDB',
+        maxZoom: 19
+      }).addTo(mapInstance.current);
+
+      if (position) {
+        markerInstance.current = L.marker(initialPos).addTo(mapInstance.current);
+      }
+
+      setTimeout(() => {
+        mapInstance.current?.invalidateSize();
+      }, 250);
+
+      mapInstance.current.on('click', (e: any) => {
+        setPosition({ lat: e.latlng.lat, lng: e.latlng.lng });
+      });
+    });
+
+    return () => {
+      if (mapInstance.current) {
+        mapInstance.current.remove();
+        mapInstance.current = null;
+      }
+    };
   }, []);
-  
-  return now;
-};
 
-const formatRelativeTime = (date: Date | string, clientNow: Date) => {
-  const d = new Date(date);
-  const diffMs = clientNow.getTime() - d.getTime();
-  const diffMins = Math.round(diffMs / 60000);
-  
-  if (diffMins < 1) return 'Just now';
-  if (diffMins < 60) return `${diffMins}m ago`;
-  const diffHrs = Math.round(diffMins / 60);
-  if (diffHrs < 24) return `${diffHrs}h ago`;
-  return d.toLocaleDateString();
-};
+  useEffect(() => {
+    if (typeof window !== 'undefined' && mapInstance.current && position) {
+      import('leaflet').then((L) => {
+        const targetPos: [number, number] = [position.lat, position.lng];
 
-// Animated message bubble with rich content support
-const MessageBubble = ({ message, clientNow }: { message: Message; clientNow: Date }) => {
+        if (!markerInstance.current) {
+           markerInstance.current = L.marker(targetPos).addTo(mapInstance.current);
+        } else {
+           markerInstance.current.setLatLng(targetPos);
+        }
+        mapInstance.current.flyTo(targetPos, 16, { animate: true, duration: 1 });
+      });
+    }
+  }, [position]);
+
+  return <div ref={mapContainer} className="w-full h-full z-0 bg-zinc-900" />;
+}
+
+// =============================================================================
+// 💬 UI COMPONENTS
+// =============================================================================
+const MessageBubble = ({ message }: { message: Message }) => {
   const isUser = message.role === 'user';
-  
+  const isSystem = message.role === 'system';
+
+  if (isSystem) {
+    return (
+      <div className="flex justify-center my-6">
+        <div className="bg-zinc-900/80 backdrop-blur-md border border-zinc-800/80 text-zinc-400 text-xs px-5 py-3 rounded-xl font-mono tracking-wide max-w-[85%] text-center shadow-lg shadow-black/20">
+          <div className="prose prose-invert prose-sm">
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>
+              {message.content}
+            </ReactMarkdown>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 20, scale: 0.98 }}
-      animate={{ opacity: 1, y: 0, scale: 1 }}
-      exit={{ opacity: 0, y: -10 }}
-      transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
-      className={cn(
-        'chat-bubble mb-4',
-        isUser ? 'chat-bubble-out' : 'chat-bubble-in'
-      )}
-    >
-      {/* Attachment preview */}
-      {message.attachment && (
-        <div className="mb-3">
-          {message.attachment.type === 'image' && message.attachment.preview && (
-            <div className="attachment-preview rounded-xl overflow-hidden">
-              <img 
-                src={message.attachment.preview} 
-                alt="Attachment" 
-                className="image-fade loading w-full max-w-[200px] object-cover"
-                onLoad={(e) => e.currentTarget.classList.add('loaded')}
-              />
+    <motion.div variants={fadeInUp} className={cn("flex mb-6 w-full gap-4", isUser ? "flex-row-reverse" : "flex-row")}>
+      
+      {/* Avatar */}
+      <div className="flex-shrink-0 mt-1">
+        {isUser ? (
+          <div className="w-8 h-8 rounded-full bg-zinc-800 flex items-center justify-center border border-zinc-700">
+            <User className="w-4 h-4 text-zinc-400" />
+          </div>
+        ) : (
+          <div className="w-8 h-8 rounded-full bg-indigo-500/10 flex items-center justify-center border border-indigo-500/30 shadow-[0_0_15px_rgba(99,102,241,0.15)]">
+            <Cpu className="w-4 h-4 text-indigo-400" />
+          </div>
+        )}
+      </div>
+
+      {/* Message Content */}
+      <div className={cn("flex flex-col max-w-[80%]", isUser ? "items-end" : "items-start")}>
+        <div className={cn(
+          "relative px-5 py-4 rounded-2xl transition-all duration-300 text-sm shadow-xl",
+          isUser 
+            ? "bg-zinc-100 text-zinc-950 rounded-tr-sm shadow-zinc-100/10" 
+            : "bg-zinc-900/90 backdrop-blur-md text-zinc-100 border border-zinc-800 rounded-tl-sm"
+        )}>
+          {message.attachment?.preview && (
+            <div className="mb-4 rounded-xl overflow-hidden bg-zinc-950 border border-zinc-800/50 shadow-inner">
+              <img src={message.attachment.preview} alt="Attachment" className="w-full h-auto max-h-64 object-cover" />
             </div>
           )}
           
-          {message.attachment.type === 'location' && message.attachment.location && (
-            <div className="glass-panel p-3 rounded-xl flex items-center gap-3">
-              <Map className="w-5 h-5 text-[var(--primary)] flex-shrink-0" />
+          {message.attachment?.type === 'voice' && (
+            <div className="mb-3 flex items-center gap-3 bg-zinc-800/40 p-3 rounded-xl border border-zinc-700/50">
+              <div className="w-8 h-8 rounded-full bg-zinc-700/80 flex items-center justify-center"><Mic className="w-4 h-4 text-indigo-400" /></div>
+              <div className="flex-1 h-1.5 bg-zinc-700/50 rounded-full overflow-hidden"><div className="w-1/3 h-full bg-indigo-500 rounded-full" /></div>
+              <span className="text-xs font-mono text-zinc-400">Audio Payload</span>
+            </div>
+          )}
+          
+          {message.attachment?.type === 'location' && message.attachment.location && (
+            <div className="mb-4 flex items-start gap-3 bg-zinc-950/50 p-3 rounded-xl border border-zinc-800/80 shadow-inner">
+              <MapPin className="w-5 h-5 text-indigo-400 flex-shrink-0 mt-0.5" />
               <div className="min-w-0">
-                <p className="font-medium text-sm truncate">
-                  {message.attachment.location.address_text || 'Location attached'}
+                <p className="font-medium text-sm text-zinc-200 truncate">
+                  {message.attachment.location.address_text || 'Hardware GPS Locked'}
                 </p>
-                <p className="text-xs text-white/60">
+                <p className="text-[10px] text-zinc-500 font-mono mt-0.5">
                   {message.attachment.location.lat.toFixed(4)}, {message.attachment.location.lon.toFixed(4)}
                 </p>
               </div>
             </div>
           )}
-          
-          {message.attachment.type === 'voice' && (
-            <div className="glass-panel p-3 rounded-xl flex items-center gap-3">
-              <Mic className="w-5 h-5 text-[var(--primary)] flex-shrink-0" />
-              <div className="flex-1 h-1 bg-white/10 rounded-full overflow-hidden">
-                <motion.div 
-                  className="h-full bg-[var(--primary)] rounded-full"
-                  initial={{ width: 0 }}
-                  animate={{ width: '60%' }}
-                  transition={{ duration: 1.5, repeat: Infinity, ease: "easeInOut" }}
-                />
-              </div>
-              <span className="text-xs text-white/60">0:12</span>
-            </div>
-          )}
-        </div>
-      )}
-      
-      {/* Message content with markdown-like formatting */}
-      <div className="text-sm leading-relaxed whitespace-pre-wrap">
-        {message.content.split('\n').map((line, i) => {
-          // Bold text for emphasis
-          if (line.startsWith('**') && line.endsWith('**')) {
-            return <strong key={i} className="font-semibold">{line.slice(2, -2)}</strong>;
-          }
-          // Email highlighting
-          if (line.includes('@') && line.includes('.')) {
-            return (
-              <span key={i} className="text-[var(--primary)] font-mono">
-                {line}
+
+          <div className={cn(
+            "leading-relaxed break-words whitespace-pre-wrap max-w-none",
+            "prose prose-sm prose-p:leading-relaxed prose-pre:p-0 prose-ul:my-2 prose-li:my-0.5",
+            isUser ? "prose-zinc prose-strong:text-zinc-900" : "prose-invert prose-strong:text-white prose-a:text-indigo-400"
+          )}>
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+          </div>
+
+          {!isUser && message.content.includes('?') && (
+            <div className="mt-4 flex items-center gap-2 border-t border-zinc-800/50 pt-3 opacity-80">
+              <span className="relative flex h-2 w-2">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75"></span>
+                <span className="relative inline-flex rounded-full h-2 w-2 bg-indigo-500"></span>
               </span>
-            );
-          }
-          return <span key={i}>{line}<br /></span>;
-        })}
-      </div>
-      
-      {/* Metadata cards for rich bot replies */}
-      {message.metadata && (
-        <div className="mt-3 space-y-2">
-          {message.metadata.authScore !== undefined && (
-            <div className="glass-panel rounded-lg p-3">
-              <div className="flex items-center gap-2 mb-1">
-                <ShieldCheck className="w-4 h-4 text-green-400" />
-                <span className="text-xs font-medium">Verification Result</span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-sm">Authenticity Score</span>
-                <span className="font-mono font-bold text-[var(--primary)]">
-                  {(message.metadata.authScore * 100).toFixed(0)}%
-                </span>
-              </div>
-              {message.metadata.issueCategory && (
-                <p className="text-xs text-white/60 mt-1">
-                  Issue: {message.metadata.issueCategory.replace('_', ' ')}
-                </p>
-              )}
-            </div>
-          )}
-          
-          {message.metadata.draftedContent && (
-            <div className="glass-panel rounded-lg p-3">
-              <div className="flex items-center gap-2 mb-2">
-                <FileText className="w-4 h-4 text-[var(--primary)]" />
-                <span className="text-xs font-medium">Drafted Complaint</span>
-              </div>
-              <p className="text-xs text-white/80 italic line-clamp-3">
-                "{message.metadata.draftedContent}"
-              </p>
-            </div>
-          )}
-          
-          {message.metadata.officialEmail && (
-            <div className="glass-panel rounded-lg p-3 border border-green-500/30 bg-green-500/5">
-              <div className="flex items-center gap-2 mb-1">
-                <Mail className="w-4 h-4 text-green-400" />
-                <span className="text-xs font-medium text-green-300">Successfully Dispatched</span>
-              </div>
-              <p className="text-sm font-mono text-green-300 break-all">
-                {message.metadata.officialEmail}
-              </p>
+              <span className="text-[10px] font-mono uppercase tracking-widest text-zinc-400">Agent Awaiting Input</span>
             </div>
           )}
         </div>
-      )}
-      
-      {/* Timestamp & status */}
-      <div className="flex items-center justify-end gap-2 mt-2">
-        <span className="text-xs text-white/50">
-          {formatRelativeTime(message.timestamp, clientNow)}
-        </span>
-        
-        {isUser && message.status && (
-          <div className={cn('message-status', {
-            'text-blue-400': message.status === 'read',
-            'text-white/70': message.status === 'sent' || message.status === 'delivered',
-            'text-red-400': message.status === 'error'
-          })}>
-            {message.status === 'sending' && <Loader2 className="w-3 h-3 animate-spin" />}
-            {message.status === 'sent' && <Check className="w-3 h-3" />}
-            {(message.status === 'delivered' || message.status === 'read') && (
-              <CheckCheck className="w-3 h-3" />
-            )}
-            {message.status === 'processing' && <Loader2 className="w-3 h-3 animate-spin text-[var(--primary)]" />}
-            {message.status === 'error' && <AlertCircle className="w-3 h-3" />}
-          </div>
-        )}
+
+        <div className="flex items-center gap-2 mt-2 px-1">
+          <span className="text-[10px] text-zinc-500 font-mono">
+            {message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+          </span>
+          {isUser && message.status && (
+            <div className={cn("text-[10px] font-mono uppercase tracking-widest", message.status === 'processing' ? "text-indigo-400" : "text-zinc-600")}>
+              {message.status === 'processing' ? <span className="flex items-center gap-1"><Loader2 className="w-3 h-3 animate-spin" /> Transmitting</span> : <CheckCheck className="w-3.5 h-3.5" />}
+            </div>
+          )}
+        </div>
       </div>
     </motion.div>
   );
 };
 
-// Typing indicator with animated dots
-const TypingIndicator = () => (
-  <motion.div
-    initial={{ opacity: 0, y: 10 }}
-    animate={{ opacity: 1, y: 0 }}
-    exit={{ opacity: 0, y: -10 }}
-    className="chat-bubble chat-bubble-in mb-4"
-  >
-    <div className="typing-indicator">
-      {[0, 1, 2].map((i) => (
-        <span key={i} className="typing-dot" style={{ '--i': i } as React.CSSProperties} />
-      ))}
-    </div>
-  </motion.div>
-);
-
-// Location picker modal
-const LocationPicker = ({ 
-  isOpen, 
-  onClose, 
-  onSelect 
-}: { 
-  isOpen: boolean; 
-  onClose: () => void; 
-  onSelect: (location: LocationData) => void 
-}) => {
-  const [selected, setSelected] = useState<LocationData>();
-  
-  const handleUseCurrent = async () => {
-    if (!navigator.geolocation) {
-      toast.error('Geolocation not supported');
-      return;
-    }
-    
-    try {
-      const position = await new Promise<GeolocationPosition>((resolve, reject) => {
-        navigator.geolocation.getCurrentPosition(resolve, reject, {
-          enableHighAccuracy: true,
-          timeout: 10000,
-          maximumAge: 0
-        });
-      });
-      
-      const { latitude, longitude } = position.coords;
-      const location: LocationData = { 
-        lat: latitude, 
-        lon: longitude, 
-        type: 'gps',
-        address_text: 'Current location'
-      };
-      setSelected(location);
-      onSelect(location);
-      onClose();
-      toast.success('Location attached');
-    } catch (error) {
-      toast.error('Could not get location. Please enable permissions.');
-    }
-  };
-  
-  if (!isOpen) return null;
-  
-  return (
-    <motion.div
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm"
-      onClick={onClose}
-    >
-      <motion.div
-        initial={{ scale: 0.95, opacity: 0 }}
-        animate={{ scale: 1, opacity: 1 }}
-        exit={{ scale: 0.95, opacity: 0 }}
-        className="glass-panel w-full max-w-md rounded-3xl p-6"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="flex items-center justify-between mb-6">
-          <h3 className="text-lg font-semibold flex items-center gap-2">
-            <MapPin className="w-5 h-5 text-[var(--primary)]" />
-            Attach Location
-          </h3>
-          <button 
-            onClick={onClose}
-            className="p-2 hover:bg-white/10 rounded-full transition-colors"
-          >
-            <X className="w-5 h-5" />
-          </button>
-        </div>
-        
-        {/* Map placeholder */}
-        <div className="aspect-video bg-gradient-to-br from-blue-900/30 to-purple-900/30 rounded-2xl border border-white/10 mb-6 flex items-center justify-center">
-          <div className="text-center">
-            <Map className="w-12 h-12 text-white/40 mx-auto mb-3" />
-            <p className="text-white/60 text-sm">Map preview</p>
-            <p className="text-white/40 text-xs mt-1">
-              {selected ? `${selected.lat.toFixed(4)}, ${selected.lon.toFixed(4)}` : 'Select location'}
-            </p>
-          </div>
-        </div>
-        
-        {/* Actions */}
-        <div className="space-y-3">
-          <button
-            onClick={handleUseCurrent}
-            className="glass-btn w-full justify-center gap-2"
-          >
-            <MapPin className="w-4 h-4" />
-            Use Current Location
-          </button>
-          
-          <button
-            onClick={onClose}
-            className="glass-btn glass-btn-outline w-full justify-center"
-          >
-            Cancel
-          </button>
-        </div>
-      </motion.div>
-    </motion.div>
-  );
-};
-
-// Status tracking panel with real-time updates
-const StatusPanel = ({ 
-  trackingId, 
-  status,
-  lastUpdatedAt 
-}: { 
-  trackingId?: string; 
-  status?: GrievanceStatus;
-  lastUpdatedAt?: string;
-}) => {
-  const [isExpanded, setIsExpanded] = useState(false);
-  const clientNow = useClientTime();
-  
-  if (!trackingId) return null;
-  
-  return (
-    <motion.div
-      initial={{ opacity: 0, y: 10 }}
-      animate={{ opacity: 1, y: 0 }}
-      className="glass-panel rounded-2xl p-4 mb-4"
-    >
-      <button
-        onClick={() => setIsExpanded(!isExpanded)}
-        className="w-full flex items-center justify-between text-left"
-      >
-        <div className="flex items-center gap-3">
-          <div className="live-indicator">
-            <span className="live-dot" />
-            <span className="text-xs font-medium">Live Tracking</span>
-          </div>
-          <span className="text-sm font-mono text-[var(--primary)]">{trackingId}</span>
-        </div>
-        <motion.span
-          animate={{ rotate: isExpanded ? 180 : 0 }}
-          transition={{ duration: 0.2 }}
-          className="text-white/60"
-        >
-          ▼
-        </motion.span>
-      </button>
-      
-      <AnimatePresence>
-        {isExpanded && status && (
-          <motion.div
-            initial={{ opacity: 0, height: 0 }}
-            animate={{ opacity: 1, height: 'auto' }}
-            exit={{ opacity: 0, height: 0 }}
-            className="mt-4 pt-4 border-t border-white/10"
-          >
-            <div className="flex items-start gap-3">
-              <ShieldCheck className="w-5 h-5 text-[var(--status-success)] flex-shrink-0 mt-0.5" />
-              <div>
-                <p className="text-sm font-medium mb-1">
-                  {CONVERSATIONAL_MESSAGES[status] || DEFAULT_STATUS_MESSAGE}
-                </p>
-                <p className="text-xs text-white/60">
-                  Last updated: {lastUpdatedAt ? formatRelativeTime(lastUpdatedAt, clientNow) : 'Just now'}
-                </p>
-              </div>
-            </div>
-            
-            {/* Progress steps */}
-            <div className="mt-4 flex items-center gap-2 overflow-x-auto pb-2">
-              {(['RECEIVED', 'VERIFYING_IMAGE', 'ROUTING_JURISDICTION', 'DISPATCHED'] as const).map((step, i) => {
-                const statusOrder = Object.keys(CONVERSATIONAL_MESSAGES);
-                const currentIndex = status ? statusOrder.indexOf(status) : -1;
-                const stepIndex = statusOrder.indexOf(step);
-                const isActive = currentIndex >= stepIndex && stepIndex !== -1;
-                
-                return (
-                  <div key={step} className="flex items-center gap-2 flex-shrink-0">
-                    <div className={cn(
-                      'w-6 h-6 rounded-full flex items-center justify-center text-xs font-medium transition-all',
-                      isActive 
-                        ? 'bg-[var(--primary)] text-black' 
-                        : 'bg-white/10 text-white/40'
-                    )}>
-                      {i + 1}
-                    </div>
-                    {i < 3 && (
-                      <div className={cn(
-                        'w-8 h-0.5 rounded-full transition-all',
-                        isActive ? 'bg-[var(--primary)]' : 'bg-white/10'
-                      )} />
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-    </motion.div>
-  );
-};
-
 // =============================================================================
-// MAIN COMPONENT
+// 🚀 DASHBOARD LOGIC 
 // =============================================================================
+function DashboardContent() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const urlThreadId = searchParams.get('thread');
 
-export default function CustomerChatPage() {
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [input, setInput] = useState('');
-  const [showLocationPicker, setShowLocationPicker] = useState(false);
-  const [attachedFile, setAttachedFile] = useState<File | null>(null);
   const [attachedPreview, setAttachedPreview] = useState<string | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-  const { scrollYProgress } = useScroll();
-  const smoothScroll = useSpring(scrollYProgress, { stiffness: 100, damping: 30 });
+  const [tempLocation, setTempLocation] = useState<LocationData | null>(null);
   
-  // ✅ FIX: Client-only time for hydration safety
-  const clientNow = useClientTime();
+  const [showLocationModal, setShowLocationModal] = useState(false);
+  const [isLocating, setIsLocating] = useState(false);
+  const [mapPinPosition, setMapPinPosition] = useState<{lat: number, lng: number} | null>(null);
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingTime, setRecordingTime] = useState(0);
+  const recordingInterval = useRef<NodeJS.Timeout | null>(null);
   
-  // ✅ NEW: Track which milestones we've already announced to avoid duplicates
-  const announcedMilestones = useRef<Set<string>>(new Set());
-  
-  // Chat state
-  const [chatState, setChatState] = useState<ChatState>({
-    messages: [INITIAL_MESSAGE],
-    isTyping: false
+  const [chatState, setChatState] = useState<ChatState>(() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem(CHAT_STORAGE_KEY);
+      if (saved) {
+        try {
+          const parsed = JSON.parse(saved);
+          parsed.messages = parsed.messages.map((m: any) => ({ ...m, timestamp: new Date(m.timestamp) }));
+          return parsed;
+        } catch (e) { console.error(e); }
+      }
+    }
+    return { messages: [INITIAL_MESSAGE], isTyping: false };
   });
-  
-  // Auto-scroll to bottom on new messages
+
+  const lastAiReply = useRef<string | null>(null);
+  const announcedMilestones = useRef<Set<string>>(new Set());
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [chatState.messages, chatState.isTyping]);
-  
-  // ✅ REAL POLLING: Fetch actual LangGraph state from FastAPI
+    if (chatState.messages.length > 1 || chatState.trackingId) {
+      localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(chatState));
+    }
+  }, [chatState]);
+
+  // 🚨 FIX 3: Explicitly force the security headers for the history fetch
+  const { data: historyData, refetch: refetchHistory } = useQuery({
+    queryKey: ['citizen-grievances'],
+    queryFn: async () => {
+      const res = await fetch('/api/v1/auth/citizen/grievances', {
+        headers: { 
+          'X-Frontend-API-Key': process.env.FRONTEND_API_KEY || 'civiclink_dev_super_secret_998877',
+          'X-Session-ID': 'demo-citizen'
+        }
+      });
+      if (!res.ok) throw new Error('History fetch failed');
+      return res.json();
+    }
+  });
+
+  useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [chatState.messages, chatState.isTyping]);
+
   useEffect(() => {
-    const trackingId = chatState.trackingId;
-    if (!trackingId) return;
-    
+    if (urlThreadId && urlThreadId !== chatState.trackingId) {
+      setChatState(prev => ({
+        ...prev,
+        trackingId: urlThreadId,
+        currentStatus: 'SYNCING_TELEMETRY',
+        messages: [{
+          id: `sys-resume`, role: 'system',
+          content: `🔄 **Synchronizing Protocol:** Restoring telemetry for thread \`${urlThreadId}\`...`,
+          timestamp: new Date()
+        }]
+      }));
+      lastAiReply.current = null;
+      announcedMilestones.current.clear();
+
+      apiClient.getStatus(urlThreadId).then((data) => {
+        if (data.current_state) {
+          setChatState(prev => ({ ...prev, currentStatus: data.current_state }));
+        }
+      }).catch(e => console.error("Immediate sync failed", e));
+    }
+  }, [urlThreadId, chatState.trackingId]);
+
+  const submitMutation = useMutation({
+    mutationFn: (payload: IngestPayload) => apiClient.submitGrievance(payload),
+    onSuccess: (data) => {
+      if (data.thread_id && !chatState.trackingId) {
+        setChatState(prev => ({ ...prev, trackingId: data.thread_id, currentStatus: 'PENDING_DETAILS' }));
+        router.replace(`?thread=${data.thread_id}`, { scroll: false });
+        refetchHistory();
+        toast.success("Encrypted Session Established", { style: { background: '#18181b', color: '#fff', border: '1px solid #27272a' } });
+      }
+    },
+    onError: (error) => {
+      toast.error(`Submission Failed: ${error.message}`, {
+        style: { background: '#18181b', color: '#fff', border: '1px solid #ef4444' }
+      });
+    }
+  });
+
+  useEffect(() => {
+    if (!chatState.trackingId) return;
+
     const interval = setInterval(async () => {
       try {
-        // ✅ CORRECT (Using the public method we defined)
-        const data = await apiClient.getStatus(trackingId);
-        
-        if (data.status === 'found') {
-          // Update the top status bar if state changed
-          if (data.current_state !== chatState.currentStatus) {
-            setChatState(prev => ({ 
-              ...prev, 
-              currentStatus: data.current_state,
-              lastUpdatedAt: new Date().toISOString() 
-            }));
+        const data = await apiClient.getStatus(chatState.trackingId!);
+        const newMessages: Message[] = [];
+
+        // 🚨 FIX 2A: Always sync the current state from the backend!
+        if (data.current_state && data.current_state !== chatState.currentStatus) {
+          setChatState(prev => ({ ...prev, currentStatus: data.current_state }));
+        }
+
+        // Handle Conversational AI Replies
+        if (data.status === 'chatting' && data.reply_message) {
+          if (data.reply_message !== lastAiReply.current && data.reply_message !== "Processing...") {
+            newMessages.push({ id: `chat-${Date.now()}`, role: 'assistant', content: data.reply_message, timestamp: new Date(), status: 'delivered' });
+            lastAiReply.current = data.reply_message;
+            setChatState(prev => ({ ...prev, isTyping: false }));
+          }
+        } 
+        // Handle Official Database Pipeline Updates
+        else if (data.status === 'found') {
+          if (chatState.messages.length === 1 && chatState.messages[0].id === 'sys-resume' && data.description_text) {
+             newMessages.push({ id: `resume-ctx`, role: 'system', content: `**Context Restored:**\n_${data.description_text}_\n\n**Status:** \`${data.current_state}\``, timestamp: new Date() });
           }
 
-          // ✅ CONVERSATIONAL MILESTONES: Inject contextual bot replies
-          const newMessages: Message[] = [];
-
-          // Milestone A: VLM Verification Complete
-          if (
-            data.system_metadata?.auth_score !== undefined && 
-            !announcedMilestones.current.has('vlm_verified')
-          ) {
-            const score = (data.system_metadata.auth_score * 100).toFixed(0);
-            const issue = data.issue_category?.replace('_', ' ') || 'civic issue';
-            
-            newMessages.push({
-              id: `vlm-${Date.now()}`,
-              role: 'system',
-              content: `🔍 **Forensics Complete:** I've analyzed the image. Authenticity score is **${score}%**. Issue categorized as: **${issue}**.`,
-              timestamp: new Date(),
-              status: 'delivered',
-              metadata: {
-                authScore: data.system_metadata.auth_score,
-                issueCategory: data.issue_category
-              }
-            });
-            announcedMilestones.current.add('vlm_verified');
+          if (data.system_metadata?.auth_score !== undefined && !announcedMilestones.current.has('vlm')) {
+            newMessages.push({ id: `vlm-${Date.now()}`, role: 'system', content: `**Forensics Complete:** Authenticity verified at ${(data.system_metadata.auth_score * 100).toFixed(0)}%. \nCategorized as \`${data.issue_category}\`.`, timestamp: new Date() });
+            announcedMilestones.current.add('vlm');
           }
-
-          // Milestone B: Jurisdiction Resolved
-          if (
-            data.system_metadata?.jurisdiction && 
-            !announcedMilestones.current.has('jurisdiction_found')
-          ) {
-            const { district, state, ward } = data.system_metadata.jurisdiction;
-            newMessages.push({
-              id: `jurisdiction-${Date.now()}`,
-              role: 'system',
-              content: `📍 **Jurisdiction Identified:** This falls under **${ward ? `${ward}, ` : ''}${district}, ${state}**. Locating the responsible official...`,
-              timestamp: new Date(),
-              status: 'delivered'
-            });
-            announcedMilestones.current.add('jurisdiction_found');
-          }
-
-          // Milestone C: Contact Discovered
-          if (
-            data.system_metadata?.official_email && 
-            !announcedMilestones.current.has('contact_found')
-          ) {
-            newMessages.push({
-              id: `contact-${Date.now()}`,
-              role: 'system',
-              content: `👔 **Official Found:** Verified contact for **${data.system_metadata.official_designation || 'the responsible authority'}**.`,
-              timestamp: new Date(),
-              status: 'delivered'
-            });
-            announcedMilestones.current.add('contact_found');
-          }
-
-          // Milestone D: Letter Drafted
-          if (
-            data.description_text && 
-            data.current_state === 'DRAFTING_LETTER' && 
-            !announcedMilestones.current.has('letter_drafted')
-          ) {
-            const preview = data.description_text.substring(0, 120) + (data.description_text.length > 120 ? '...' : '');
-            newMessages.push({
-              id: `draft-${Date.now()}`,
-              role: 'system',
-              content: `✍️ **Draft Generated:** I've written the formal legal directive based on municipal bylaws.\n\n"_${preview}_"\n\nLocating the correct official now.`,
-              timestamp: new Date(),
-              status: 'delivered',
-              metadata: {
-                draftedContent: preview
-              }
-            });
-            announcedMilestones.current.add('letter_drafted');
-          }
-
-        // Milestone E: Successfully Dispatched
-          const records = data.dispatch_records; // 1. Extract to local variable
           
-          if (
-            data.current_state === 'DISPATCHED' && 
-            records && // 2. Prove it exists
-            records.length > 0 && // 3. Prove it's not empty
-            !announcedMilestones.current.has('dispatched')
-          ) {
-            // TypeScript now 100% trusts that `records[0]` is safe to access
-            const officialEmail = records[0].email;
-            const officialName = records[0].official_name || 'the responsible official';
-            
-            newMessages.push({
-              id: `dispatch-${Date.now()}`,
-              role: 'system',
-              content: `📤 **Success!** The formal grievance has been digitally signed via DKIM and securely dispatched to:\n\n👤 **${officialName}**\n📧 **${officialEmail}**\n\nI will monitor their inbox for a reply. You can track updates here.`,
-              timestamp: new Date(),
-              status: 'delivered',
-              metadata: {
-                officialEmail: officialEmail
-              }
-            });
-            announcedMilestones.current.add('dispatched');
-          }
-
-          // Milestone F: Issue Resolved
-          if (
-            data.current_state === 'RESOLVED' && 
-            !announcedMilestones.current.has('resolved')
-          ) {
-            newMessages.push({
-              id: `resolved-${Date.now()}`,
-              role: 'system',
-              content: `✅ **Issue Resolved!** The official has marked your grievance as resolved. Thank you for helping improve our community!`,
-              timestamp: new Date(),
-              status: 'delivered'
-            });
-            announcedMilestones.current.add('resolved');
-          }
-
-          // Inject the new conversational messages into the chat
-          if (newMessages.length > 0) {
-            setChatState(prev => ({
-              ...prev,
-              messages: [...prev.messages, ...newMessages]
-            }));
+          if (data.current_state === 'DISPATCHED' && !announcedMilestones.current.has('sent')) {
+            const email = data.dispatch_records?.[0]?.email || "Authority";
+            newMessages.push({ id: `sent-${Date.now()}`, role: 'assistant', content: `**Formal Directive Executed.**\nI have cryptographically signed the report and dispatched it to **${email}**. I will continue to monitor this thread.`, timestamp: new Date() });
+            announcedMilestones.current.add('sent');
           }
         }
-      } catch (error) {
-        console.error('Real status poll error:', error);
-      }
-    }, 3000); // Poll every 3 seconds
-    
+
+        if (newMessages.length > 0) setChatState(prev => ({ ...prev, messages: [...prev.messages, ...newMessages] }));
+      } catch (e) { console.error("Telemetry fault:", e); }
+    }, 3000);
     return () => clearInterval(interval);
-  }, [chatState.trackingId, chatState.currentStatus]);
-  
-  // Submit grievance mutation
-  const submitMutation = useMutation({
-    mutationFn: async (payload: IngestPayload) => {
-      return apiClient.submitGrievance(payload);
-    },
-    onMutate: () => {
-      // Optimistic update: mark last user message as "processing"
-      setChatState(prev => ({
-        ...prev,
-        messages: prev.messages.map((msg, i) => 
-          i === prev.messages.length - 1 && msg.role === 'user'
-            ? { ...msg, status: 'processing' }
-            : msg
-        ),
-        isTyping: true
-      }));
-    },
-    onSuccess: (data: IngestResponse) => {
-      if (data.thread_id) {
-        setChatState(prev => ({
-          ...prev,
-          trackingId: data.thread_id,
-          currentStatus: 'RECEIVED',
-          isTyping: false,
-          lastUpdatedAt: new Date().toISOString()
-        }));
-        
-        // Add tracking confirmation message
-        const trackingMessage: Message = {
-          id: `tracking-${Date.now()}`,
-          role: 'system',
-          content: `🎫 Tracking ID: \`${data.thread_id}\`\n\nYour grievance is now being processed. You'll receive real-time updates here.`,
-          timestamp: new Date(),
-          status: 'delivered'
-        };
-        setChatState(prev => ({
-          ...prev,
-          messages: [...prev.messages, trackingMessage]
-        }));
-        
-        toast.success('Grievance submitted successfully');
-      }
-    },
-    onError: (error: Error) => {
-      setChatState(prev => ({
-        ...prev,
-        isTyping: false,
-        messages: [
-          ...prev.messages,
-          {
-            id: `error-${Date.now()}`,
-            role: 'system',
-            content: `❌ Error: ${error.message}\n\nPlease try again or contact support.`,
-            timestamp: new Date(),
-            status: 'error'
-          }
-        ]
-      }));
-      toast.error('Failed to submit grievance');
-    }
-  });
-  
-  // ✅ FIX: Convert base64 preview to data URL for prototype compatibility
-  const getImageUrlForPayload = useCallback((preview: string | null, file: File | null): string | undefined => {
-    if (!preview) return undefined;
-    
-    // If it's already a data URL (base64), return as-is for prototype
-    if (preview.startsWith('data:image')) {
-      return preview;
-    }
-    
-    // If it's a blob URL, skip for prototype (upload to Supabase in production)
-    if (preview.startsWith('blob:')) {
-      return undefined;
-    }
-    
-    return preview;
-  }, []);
-  
-  // Handle sending message
-  const handleSend = useCallback(async () => {
-    if (!input.trim() && !attachedFile) return;
-    
-    // Create user message
-    const userMessage: Message = {
-      id: `user-${Date.now()}`,
-      role: 'user',
-      content: input.trim(),
-      timestamp: new Date(),
-      status: 'sending',
-      attachment: attachedFile ? {
-        type: attachedFile.type.startsWith('image/') ? 'image' : 'voice',
-        preview: attachedPreview || undefined
-      } : chatState.location ? {
-        type: 'location',
-        location: chatState.location
-      } : undefined
+  }, [chatState.trackingId, chatState.currentStatus, chatState.messages.length]);
+
+  const handleSend = useCallback((overrideText?: string, overrideVoice?: boolean) => {
+    const finalInput = overrideText || input;
+    if (!finalInput.trim() && !attachedPreview && !tempLocation && !overrideVoice) return;
+
+    const userMsg: Message = {
+      id: `u-${Date.now()}`, role: 'user', content: finalInput, timestamp: new Date(), status: 'processing',
+      attachment: overrideVoice ? { type: 'voice' } : attachedPreview ? { type: 'image', preview: attachedPreview } : tempLocation ? { type: 'location', location: tempLocation } : undefined
     };
+
+    setChatState(prev => ({ ...prev, messages: [...prev.messages, userMsg], isTyping: true }));
     
-    // Add to chat immediately (optimistic)
-    setChatState(prev => ({
-      ...prev,
-      messages: [...prev.messages, userMessage],
-      location: undefined // Clear location after attaching
-    }));
-    
-    // ✅ FIX: Ensure location has required 'type' field
-    const locationPayload: LocationData = chatState.location || {
-      lat: 22.5726, // Default: Salt Lake, Kolkata
-      lon: 88.4140,
-      type: 'text' // ✅ FIX: Required field
-    };
-    
-    // ✅ FIX: Get image URL for payload (base64 for prototype)
-    const imageUrl = getImageUrlForPayload(attachedPreview, attachedFile);
-    
-    // ✅ FIX: Get phone number from env or use demo fallback
-    const phoneNumber = process.env.NEXT_PUBLIC_DEMO_PHONE || 'demo-user-123';
-    
-    // Prepare payload for API
-    const payload: IngestPayload = {
-      phone_number: phoneNumber,
+    submitMutation.mutate({
+      phone_number: process.env.NEXT_PUBLIC_DEMO_PHONE || 'demo-citizen',
       thread_id: chatState.trackingId || `thread-${Date.now()}`,
-      text_message: input.trim(),
-      image_url: imageUrl, // ✅ FIX: Include image for VLM processing
-      location: locationPayload
-    };
-    
-    // ✅ FIX: Use mutate() instead of mutateAsync() to avoid unhandled promise rejection
-    submitMutation.mutate(payload);
-    
-    // Reset input
-    setInput('');
-    setAttachedFile(null);
-    setAttachedPreview(null);
-    
-    // Reset milestones for new grievance
+      text_message: overrideVoice ? "[Voice note transcribed internally]" : finalInput,
+      image_url: attachedPreview || undefined,
+      location: tempLocation || undefined  // 🚨 FIXED: Phantom GPS eliminated
+    });
+
+    setInput(''); setAttachedPreview(null); setTempLocation(null); setMapPinPosition(null);
+  }, [input, attachedPreview, tempLocation, chatState.trackingId, submitMutation]);
+
+  const handleNewSession = useCallback(() => {
+    setChatState({ messages: [INITIAL_MESSAGE], isTyping: false });
+    localStorage.removeItem(CHAT_STORAGE_KEY);
+    lastAiReply.current = null;
     announcedMilestones.current.clear();
-  }, [input, attachedFile, attachedPreview, chatState.location, chatState.trackingId, submitMutation, getImageUrlForPayload]);
-  
-  // Handle file selection
-  const handleFileSelect = useCallback((file: File) => {
-    if (file.size > 10 * 1024 * 1024) {
-      toast.error('File too large. Max 10MB.');
-      return;
+    setInput('');
+    router.replace('/dashboard');
+  }, [router]);
+
+  const handleLogout = useCallback(() => {
+    localStorage.removeItem(USER_STORAGE_KEY);
+    localStorage.removeItem(CHAT_STORAGE_KEY);
+    toast.success("Securely disconnected.");
+    router.replace('/');
+  }, [router]);
+
+  const requestLocation = () => {
+    setIsLocating(true);
+    if (!navigator.geolocation) { toast.error('Geolocation not supported'); setIsLocating(false); return; }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setMapPinPosition({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+        toast.success("Hardware GPS Locked");
+        setIsLocating(false);
+      },
+      (err) => { toast.error(`Error: ${err.message}`); setIsLocating(false); },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+    );
+  };
+
+  const confirmMapLocation = () => {
+    if (mapPinPosition) {
+      setTempLocation({ lat: mapPinPosition.lat, lon: mapPinPosition.lng, type: 'gps', address_text: `Coordinates: ${mapPinPosition.lat.toFixed(4)}, ${mapPinPosition.lng.toFixed(4)}` });
+      setShowLocationModal(false);
+      toast.success("Geo-tag attached.");
     }
-    
-    setAttachedFile(file);
-    
-    // Generate preview for images
-    if (file.type.startsWith('image/')) {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        const result = e.target?.result as string;
-        // Ensure it's a data URL for prototype compatibility
-        if (result && result.startsWith('data:image')) {
-          setAttachedPreview(result);
-        }
-      };
-      reader.readAsDataURL(file);
+  };
+
+  const toggleRecording = () => {
+    if (isRecording) {
+      clearInterval(recordingInterval.current!);
+      setIsRecording(false); setRecordingTime(0);
+      handleSend("Voice transmission complete.", true);
+    } else {
+      setIsRecording(true);
+      recordingInterval.current = setInterval(() => setRecordingTime(prev => prev + 1), 1000);
     }
-    
-    toast.success('Attachment added');
-  }, []);
-  
-  // Handle location attach
-  const handleLocationAttach = useCallback((location: LocationData) => {
-    setChatState(prev => ({ ...prev, location }));
-    toast.success('Location attached');
-  }, []);
-  
-  // Clear attachment
-  const clearAttachment = useCallback(() => {
-    setAttachedFile(null);
-    setAttachedPreview(null);
-  }, []);
-  
-  // Keyboard shortcut: Enter to send
-  const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      handleSend();
-    }
-  }, [handleSend]);
-  
-  // Memoize message list for performance
-  const messageList = useMemo(() => chatState.messages, [chatState.messages]);
-  
+  };
+
+  const hasConfirmed = chatState.messages.some(m => m.role === 'user' && m.content.toLowerCase().includes('proceed'));
+  const isPipelineActive = (chatState.currentStatus && !['PENDING_DETAILS', 'RESOLVED'].includes(chatState.currentStatus)) || hasConfirmed;
+
+  let placeholderText = "Input directive...";
+  if (isPipelineActive) {
+    if (chatState.currentStatus === 'AWAITING_REVIEW') placeholderText = "🔒 Locked: Awaiting Admin Authorization...";
+    else if (chatState.currentStatus === 'DISPATCHED') placeholderText = "✅ Locked: Payload Dispatched.";
+    else if (chatState.currentStatus === 'FAILED') placeholderText = "⚠️ Locked: Pipeline Fault Detected.";
+    else placeholderText = "⚙️ Executing Backend Pipeline...";
+  }
+
   return (
-    <div className="min-h-screen flex flex-col bg-gradient-to-b from-[var(--background)] to-[#0d1321]">
-      {/* Connection status bar */}
-      <div className={cn(
-        'connection-bar',
-        submitMutation.isPending ? 'reconnecting' : 'online'
-      )} />
-      
-      {/* Header */}
-      <header className="glass-panel border-b-0 rounded-b-3xl p-4 flex items-center justify-between sticky top-0 z-40">
-        <div>
-          <h1 className="text-lg font-bold text-gradient-customer">CivicLink Assistant</h1>
-          <p className="text-xs text-white/60">Secure • Verified • Instant</p>
-        </div>
-        <div className="live-indicator">
-          <span className="live-dot" />
-          <span className="text-xs">Online</span>
-        </div>
-      </header>
-      
-      {/* Status panel */}
-      <div className="px-4 pt-4">
-        <StatusPanel 
-          trackingId={chatState.trackingId} 
-          status={chatState.currentStatus}
-          lastUpdatedAt={chatState.lastUpdatedAt}
-        />
-      </div>
-      
-      {/* Chat messages */}
-      <main className="flex-1 overflow-y-auto px-4 py-4 space-y-2">
-        <AnimatePresence mode="popLayout">
-          {messageList.map((message) => (
-            <MessageBubble key={message.id} message={message} clientNow={clientNow} />
-          ))}
-          
-          {chatState.isTyping && <TypingIndicator />}
-          
-          <div ref={messagesEndRef} />
-        </AnimatePresence>
-      </main>
-      
-      {/* Attachment preview */}
+    <>
       <AnimatePresence>
-        {(attachedPreview || chatState.location) && (
-          <motion.div
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: 20 }}
-            className="px-4 pb-2"
-          >
-            <div className="glass-panel rounded-2xl p-3 flex items-center gap-3">
-              {attachedPreview && (
-                <img 
-                  src={attachedPreview} 
-                  alt="Preview" 
-                  className="w-16 h-16 object-cover rounded-xl"
-                />
-              )}
-              {chatState.location && (
-                <div className="flex items-center gap-2">
-                  <MapPin className="w-5 h-5 text-[var(--primary)]" />
-                  <span className="text-sm">
-                    {chatState.location.address_text || 'Location attached'}
-                  </span>
-                </div>
-              )}
-              <button
-                onClick={clearAttachment}
-                className="ml-auto p-1.5 hover:bg-white/10 rounded-full transition-colors"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-      
-      {/* Input area */}
-      <footer className="glass-panel border-t-0 rounded-t-3xl p-4 sticky bottom-0 z-40">
-        <div className="flex items-end gap-3">
-          {/* Action buttons */}
-          <div className="flex flex-col gap-2">
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              className="p-2.5 hover:bg-white/10 rounded-xl transition-colors focus-ring"
-              title="Attach image"
-              aria-label="Attach image"
-            >
-              <ImageIcon className="w-5 h-5" />
-            </button>
-            <button
-              onClick={() => setShowLocationPicker(true)}
-              className="p-2.5 hover:bg-white/10 rounded-xl transition-colors focus-ring"
-              title="Attach location"
-              aria-label="Attach location"
-            >
-              <MapPin className="w-5 h-5" />
-            </button>
-            <button
-              className="p-2.5 hover:bg-white/10 rounded-xl transition-colors focus-ring"
-              title="Record voice"
-              aria-label="Record voice"
-              disabled
-            >
-              <Mic className="w-5 h-5 opacity-50" />
-            </button>
-          </div>
-          
-          {/* Text input */}
-          <div className="flex-1 relative">
-            <textarea
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder="Describe the issue..."
-              rows={1}
-              className="glass-input w-full pr-12 resize-none max-h-32 overflow-y-auto"
-              style={{ minHeight: '48px' }}
-              aria-label="Message input"
+        {isSidebarOpen && (
+          <>
+            {/* Mobile Overlay */}
+            <motion.div 
+              initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+              onClick={() => setIsSidebarOpen(false)}
+              className="fixed inset-0 bg-black/60 backdrop-blur-sm z-40 md:hidden"
             />
-            
-            {/* Send button */}
-            <button
-              onClick={handleSend}
-              disabled={(!input.trim() && !attachedFile && !chatState.location) || submitMutation.isPending}
-              className={cn(
-                'absolute right-3 bottom-3 p-2 rounded-xl transition-all focus-ring',
-                (input.trim() || attachedFile || chatState.location) && !submitMutation.isPending
-                  ? 'glass-btn glass-btn-customer'
-                  : 'bg-white/10 cursor-not-allowed'
-              )}
-              aria-label="Send message"
+            {/* Sidebar Panel */}
+            <motion.aside 
+              initial={{ x: -300, opacity: 0 }} animate={{ x: 0, opacity: 1 }} exit={{ x: -300, opacity: 0 }} 
+              transition={{ type: "spring", damping: 25, stiffness: 200 }}
+              className="fixed md:relative inset-y-0 left-0 w-72 flex flex-col border-r border-zinc-800/60 bg-[#050505] flex-shrink-0 z-50 shadow-2xl"
             >
-              {submitMutation.isPending ? (
-                <Loader2 className="w-4 h-4 animate-spin" />
-              ) : (
-                <Send className="w-4 h-4" />
-              )}
-            </button>
-          </div>
-        </div>
-        
-        {/* Hidden file input */}
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept="image/*,audio/*"
-          className="hidden"
-          onChange={(e) => {
-            const file = e.target.files?.[0];
-            if (file) handleFileSelect(file);
-            e.target.value = '';
-          }}
-          aria-hidden="true"
-        />
-      </footer>
-      
-      {/* Location picker modal */}
-      <AnimatePresence>
-        {showLocationPicker && (
-          <LocationPicker
-            isOpen={showLocationPicker}
-            onClose={() => setShowLocationPicker(false)}
-            onSelect={handleLocationAttach}
-          />
+              <div className="p-5 border-b border-zinc-800/60 flex items-center justify-between bg-zinc-950/50">
+                <div className="flex items-center gap-3">
+                  <div className="w-8 h-8 bg-zinc-100 rounded-lg flex items-center justify-center shadow-sm">
+                    <Cpu className="w-5 h-5 text-zinc-950" />
+                  </div>
+                  <span className="font-bold tracking-tight text-sm">CivicLink Core</span>
+                </div>
+                <button onClick={() => setIsSidebarOpen(false)} className="md:hidden p-2 hover:bg-zinc-800 rounded-lg text-zinc-400">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+              
+              <div className="p-4">
+                <button onClick={handleNewSession} className="w-full flex items-center justify-center gap-2 py-3 px-4 bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 rounded-xl text-sm transition-all text-zinc-200 shadow-sm font-semibold">
+                  <Plus className="w-4 h-4" /> New Initialization
+                </button>
+              </div>
+
+              <div className="flex-1 overflow-y-auto custom-scrollbar px-4 pb-4 space-y-2">
+                <p className="text-[10px] uppercase font-mono text-zinc-500 tracking-widest px-1 mb-4 mt-2">Active Sessions</p>
+                {historyData?.grievances?.map((g: any) => (
+                  <button
+                    key={g.tracking_id}
+                    onClick={() => { router.push(`?thread=${g.tracking_id}`); setIsSidebarOpen(false); }}
+                    className={cn(
+                      "w-full text-left px-4 py-4 rounded-xl border transition-all flex flex-col gap-2 group",
+                      chatState.trackingId === g.tracking_id ? "bg-zinc-900 border-zinc-700 shadow-md" : "bg-transparent border-transparent hover:bg-zinc-900/40"
+                    )}
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-mono text-zinc-400 group-hover:text-zinc-200 transition-colors">#{g.tracking_id.split('-').pop()}</span>
+                      <span className={cn("text-[9px] px-2 py-0.5 rounded flex items-center gap-1 font-bold uppercase tracking-wider", g.status === 'RESOLVED' ? "bg-emerald-500/10 text-emerald-400" : "bg-indigo-500/10 text-indigo-400")}>
+                        <span className={cn("w-1.5 h-1.5 rounded-full", g.status === 'RESOLVED' ? "bg-emerald-400" : "bg-indigo-400 animate-pulse")} />
+                        {g.status === 'PENDING_DETAILS' ? 'DRAFT' : g.status}
+                      </span>
+                    </div>
+                    <p className="text-xs text-zinc-200 truncate font-medium">{g.issue_category || 'Pending Triage'}</p>
+                    <p className="text-[10px] text-zinc-600 flex items-center gap-1.5 font-mono"><Clock className="w-3 h-3" /> {new Date(g.created_at).toLocaleDateString()}</p>
+                  </button>
+                ))}
+                {(!historyData?.grievances || historyData?.grievances?.length === 0) && <p className="text-xs text-zinc-600 font-mono text-center py-6 border border-dashed border-zinc-800 rounded-xl">0 records found.</p>}
+              </div>
+            </motion.aside>
+          </>
         )}
       </AnimatePresence>
-      
-      {/* Scroll progress indicator (subtle) */}
-      <motion.div
-        className="fixed bottom-0 left-0 right-0 h-0.5 bg-[var(--primary)] origin-left z-50 pointer-events-none"
-        style={{ scaleX: smoothScroll }}
-        aria-hidden="true"
-      />
-      {/* Toast container for react-hot-toast */}
-      <Toaster 
-        position="bottom-right" 
-        toastOptions={{
-          className: 'glass-panel text-white',
-          style: { background: 'rgba(15, 23, 42, 0.9)', backdropFilter: 'blur(10px)', color: '#fff', border: '1px solid rgba(255,255,255,0.1)' }
+
+      <div className="flex-1 flex flex-col relative h-screen min-w-0 bg-[#050505]">
+        <header className="h-16 border-b border-zinc-800/60 bg-zinc-950/80 backdrop-blur-2xl flex items-center justify-between px-4 md:px-6 sticky top-0 z-10">
+          <div className="flex items-center gap-4">
+            <button onClick={() => setIsSidebarOpen(!isSidebarOpen)} className="p-2 hover:bg-zinc-800 rounded-lg text-zinc-400 transition-colors"><Menu className="w-5 h-5" /></button>
+            <span className="hidden sm:flex text-[10px] font-mono text-zinc-400 items-center gap-2 uppercase tracking-widest"><span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.8)] animate-pulse" /> Link_Active</span>
+          </div>
+          <div className="flex items-center gap-3">
+            {chatState.trackingId && (
+              <div className="hidden sm:flex items-center gap-2 bg-zinc-900 border border-zinc-800 px-3 py-1.5 rounded-lg shadow-sm">
+                <Fingerprint className="w-3.5 h-3.5 text-indigo-400" />
+                <span className="text-[10px] font-mono text-zinc-300 uppercase tracking-widest">{chatState.trackingId}</span>
+              </div>
+            )}
+            {/* 🚨 THE LOGOUT BUTTON */}
+            <button onClick={handleLogout} className="flex items-center gap-2 px-3 py-1.5 bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/20 rounded-lg transition-colors text-xs text-rose-400">
+              <LogOut className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline font-semibold tracking-wide">Disconnect</span>
+            </button>
+          </div>
+        </header>
+
+        {/* 🚀 THE DYNAMIC ISLAND PIPELINE TRACKER */}
+        <AnimatePresence>
+          {chatState.trackingId && chatState.currentStatus && chatState.currentStatus !== 'PENDING_DETAILS' && (
+            <motion.div 
+              initial={{ opacity: 0, y: -20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              className="absolute top-20 left-1/2 -translate-x-1/2 z-30 w-[90%] md:w-auto flex justify-center"
+            >
+              <div className="glass-panel border border-zinc-700/50 bg-zinc-900/90 backdrop-blur-xl rounded-full px-5 py-2.5 flex items-center gap-3 shadow-2xl shadow-indigo-500/10">
+                {chatState.currentStatus === 'RESOLVED' || chatState.currentStatus === 'DISPATCHED' ? (
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                ) : chatState.currentStatus === 'FAILED' ? (
+                  <X className="w-4 h-4 text-rose-400" />
+                ) : (
+                  <Loader2 className="w-4 h-4 text-indigo-400 animate-spin" />
+                )}
+                <span className="text-xs font-medium text-zinc-200 pr-2 border-r border-zinc-700 whitespace-nowrap">
+                  {PIPELINE_STATUS_MESSAGES[chatState.currentStatus] || "Processing..."}
+                </span>
+                <span className="hidden sm:inline text-[10px] font-mono text-zinc-400 uppercase tracking-widest">
+                  Live Pipeline
+                </span>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        <main className="flex-1 overflow-y-auto px-4 md:px-8 py-8 custom-scrollbar pb-48">
+          <motion.div initial="hidden" animate="show" variants={staggerContainer} className="max-w-3xl mx-auto mt-6">
+            {chatState.messages.map(m => <MessageBubble key={m.id} message={m} />)}
+            {chatState.isTyping && (
+              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="flex gap-4 mb-6">
+                <div className="w-8 h-8 rounded-full bg-indigo-500/10 flex items-center justify-center border border-indigo-500/30 flex-shrink-0 mt-1">
+                  <Cpu className="w-4 h-4 text-indigo-400" />
+                </div>
+                <div className="flex gap-1.5 p-5 bg-zinc-900/80 backdrop-blur-md w-fit rounded-2xl border border-zinc-800 rounded-tl-sm shadow-lg">
+                  <span className="w-2 h-2 bg-zinc-500 rounded-full animate-bounce [animation-duration:0.8s]" />
+                  <span className="w-2 h-2 bg-zinc-500 rounded-full animate-bounce [animation-duration:0.8s] [animation-delay:0.2s]" />
+                  <span className="w-2 h-2 bg-zinc-500 rounded-full animate-bounce [animation-duration:0.8s] [animation-delay:0.4s]" />
+                </div>
+              </motion.div>
+            )}
+            <div ref={messagesEndRef} className="h-4" />
+          </motion.div>
+        </main>
+
+        {/* 🚀 THE CONTINUOUS INPUT FOOTER */}
+        <footer className="absolute bottom-0 left-0 right-0 p-4 md:px-8 bg-gradient-to-t from-[#050505] via-[#050505]/95 to-transparent z-40 pb-6">
+          <div className="max-w-3xl mx-auto relative">
+            <AnimatePresence>
+              {lastAiReply.current?.toLowerCase().includes('officially') && chatState.currentStatus === 'PENDING_DETAILS' && (
+                <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 10 }} className="flex gap-3 mb-5 justify-center">
+                  <button onClick={() => handleSend("Proceed with formal filing.")} className="px-6 py-3 bg-zinc-100 text-zinc-950 text-xs font-bold rounded-xl hover:bg-white transition-all shadow-[0_0_20px_rgba(255,255,255,0.1)] flex items-center gap-2">
+                    <ShieldCheck className="w-4 h-4" /> Authorize & Dispatch
+                  </button>
+                  <button onClick={() => handleSend("Halt. I need to amend the details.")} className="px-6 py-3 bg-zinc-900 border border-zinc-700 text-zinc-300 text-xs font-bold rounded-xl hover:bg-zinc-800 transition-all">
+                    Amend Payload
+                  </button>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
+            <div className="relative bg-zinc-900/90 backdrop-blur-2xl border border-zinc-700/80 transition-all duration-300 rounded-2xl shadow-2xl focus-within:border-indigo-500/50 focus-within:shadow-[0_0_30px_rgba(99,102,241,0.1)]">
+              <AnimatePresence>
+                {attachedPreview && (
+                  <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0 }} className="absolute -top-16 left-2 p-1.5 bg-zinc-800 border border-zinc-700 rounded-xl flex items-center gap-2 shadow-2xl">
+                    <img src={attachedPreview} className="w-12 h-12 rounded-lg object-cover" />
+                    <button onClick={() => setAttachedPreview(null)} className="p-1 hover:bg-zinc-700 text-zinc-400 rounded-md"><X className="w-3 h-3" /></button>
+                  </motion.div>
+                )}
+                {tempLocation && (
+                  <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0 }} className="absolute -top-14 left-2 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-xl flex items-center gap-2 shadow-2xl">
+                    <MapPin className="w-4 h-4 text-indigo-400" />
+                    <span className="text-xs font-mono text-zinc-200">{tempLocation.address_text}</span>
+                    <button onClick={() => setTempLocation(null)} className="ml-2 p-1 hover:bg-zinc-700 text-zinc-400 rounded-md"><X className="w-3 h-3" /></button>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
+              <div className="flex items-end p-2 gap-2">
+                <div className="flex gap-1 pb-1">
+                  <button onClick={() => fileInputRef.current?.click()} className="p-3 hover:bg-zinc-800 rounded-xl text-zinc-400 hover:text-zinc-100 transition-colors"><ImageIcon className="w-5 h-5" /></button>
+                  <button onClick={() => setShowLocationModal(true)} className="p-3 hover:bg-zinc-800 rounded-xl text-zinc-400 hover:text-indigo-400 transition-colors"><MapPin className="w-5 h-5" /></button>
+                  <button onClick={toggleRecording} className={cn("p-3 rounded-xl transition-colors", isRecording ? "bg-red-500/20 text-red-400" : "hover:bg-zinc-800 text-zinc-400 hover:text-zinc-100")}>
+                    {isRecording ? <Square className="w-5 h-5 fill-current" /> : <Mic className="w-5 h-5" />}
+                  </button>
+                </div>
+
+                {isRecording ? (
+                  <div className="flex-1 flex items-center justify-center gap-3 py-3">
+                    <span className="w-3 h-3 bg-red-500 rounded-full animate-pulse shadow-[0_0_10px_rgba(239,68,68,0.6)]" />
+                    <span className="font-mono text-sm text-red-400 font-bold tracking-widest">0:{recordingTime.toString().padStart(2, '0')}</span>
+                  </div>
+                ) : (
+                  <textarea 
+                    rows={1} 
+                    value={input} 
+                    onChange={(e) => setInput(e.target.value)} 
+                    onKeyDown={(e) => { if(e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }}} 
+                    placeholder={placeholderText}
+                    disabled={isPipelineActive && chatState.currentStatus !== 'PENDING_DETAILS'}
+                    className="flex-1 bg-transparent border-none outline-none text-sm py-4 px-2 placeholder:text-zinc-500 resize-none max-h-32 text-zinc-100 font-medium disabled:opacity-50" 
+                  />
+                )}
+
+                <button 
+                  onClick={() => handleSend()} 
+                  disabled={(!input.trim() && !attachedPreview && !tempLocation && !isRecording) || submitMutation.isPending || (isPipelineActive && chatState.currentStatus !== 'PENDING_DETAILS')} 
+                  className="p-4 mb-1 mr-1 bg-zinc-100 disabled:bg-zinc-800/80 disabled:text-zinc-600 text-zinc-950 rounded-xl transition-all shadow-sm"
+                >
+                  {submitMutation.isPending ? <Loader2 className="w-5 h-5 animate-spin" /> : <Send className="w-5 h-5" />}
+                </button>
+              </div>
+            </div>
+            
+            <div className="flex items-center justify-center pt-4 opacity-40">
+              <div className="flex items-center gap-1.5 text-zinc-400">
+                <ShieldCheck className="w-3.5 h-3.5" />
+                <span className="text-[10px] font-mono uppercase tracking-widest">End-to-End Encrypted (TLS 1.3)</span>
+              </div>
+            </div>
+          </div>
+        </footer>
+      </div>
+
+      {/* 🚨 THE IMAGE INPUT */}
+      <input 
+        type="file" 
+        ref={fileInputRef} 
+        className="hidden" 
+        accept="image/*" 
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (file) {
+            if (file.size > 10 * 1024 * 1024) {
+              toast.error('Image is too large. Max 10MB.');
+              return;
+            }
+            const reader = new FileReader();
+            reader.onloadend = () => {
+              setAttachedPreview(reader.result as string);
+              toast.success("Image attached to payload.");
+            };
+            reader.readAsDataURL(file);
+            e.target.value = ''; 
+          }
         }} 
       />
+
+      <AnimatePresence>
+        {showLocationModal && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-[#050505]/95 backdrop-blur-xl">
+            <motion.div initial={{ scale: 0.95, opacity: 0, y: 20 }} animate={{ scale: 1, opacity: 1, y: 0 }} exit={{ scale: 0.95, opacity: 0, y: 20 }} className="w-full max-w-2xl bg-zinc-950 border border-zinc-800 rounded-3xl overflow-hidden shadow-[0_0_50px_rgba(0,0,0,0.5)] flex flex-col">
+              <div className="flex items-center justify-between p-5 border-b border-zinc-800 bg-zinc-900/50">
+                <h3 className="text-sm font-bold tracking-wide flex items-center gap-2"><Navigation2 className="w-4 h-4 text-indigo-400" /> Geo-Spatial Calibrator</h3>
+                <button onClick={() => setShowLocationModal(false)} className="p-2 hover:bg-zinc-800 rounded-xl text-zinc-400 transition-colors"><X className="w-5 h-5" /></button>
+              </div>
+              
+              <div className="h-[450px] w-full bg-zinc-900 relative z-0">
+                <NativeMap position={mapPinPosition} setPosition={setMapPinPosition} />
+                
+                {!mapPinPosition && (
+                  <div className="absolute top-6 left-1/2 -translate-x-1/2 z-[1000] pointer-events-none">
+                    <span className="bg-zinc-950/90 border border-zinc-700 text-zinc-200 text-xs px-5 py-2.5 rounded-full shadow-2xl backdrop-blur-md font-mono tracking-widest font-semibold">
+                      CLICK TO DROP SENSOR PIN
+                    </span>
+                  </div>
+                )}
+              </div>
+
+              <div className="p-5 bg-zinc-900/50 flex gap-4">
+                <button onClick={requestLocation} disabled={isLocating} className="flex-[1] py-4 px-4 bg-zinc-950 border border-zinc-800 hover:border-indigo-500/50 rounded-xl flex items-center justify-center gap-2 transition-all disabled:opacity-50 text-sm font-semibold shadow-sm">
+                  {isLocating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Crosshair className="w-4 h-4 text-indigo-400" />} Extract HW GPS
+                </button>
+                <button onClick={confirmMapLocation} disabled={!mapPinPosition} className="flex-[1.5] py-4 px-4 bg-zinc-100 text-zinc-950 disabled:bg-zinc-800 disabled:text-zinc-600 rounded-xl transition-all font-bold text-sm shadow-md flex items-center justify-center gap-2">
+                  Confirm Coordinates <ChevronRight className="w-4 h-4" />
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+    </>
+  );
+}
+
+// =============================================================================
+// 🚨 WRAP EXPORT IN SUSPENSE FOR NEXT.JS BUILD SAFETY
+// =============================================================================
+export default function Page() {
+  return (
+    <div className="min-h-screen bg-[#050505] text-zinc-100 font-sans selection:bg-indigo-500/30">
+      <Suspense fallback={
+        <div className="flex h-screen w-full items-center justify-center bg-[#050505]">
+          <div className="flex flex-col items-center gap-4">
+            <Cpu className="w-8 h-8 text-zinc-800 animate-pulse" />
+            <Loader2 className="w-6 h-6 text-indigo-500 animate-spin" />
+            <p className="text-[10px] font-mono uppercase tracking-widest text-zinc-500">Initializing Core...</p>
+          </div>
+        </div>
+      }>
+        <DashboardContent />
+      </Suspense>
     </div>
   );
 }

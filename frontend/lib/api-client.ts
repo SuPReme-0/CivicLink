@@ -1,13 +1,39 @@
-// lib/api-client.ts
-import type { IngestPayload, IngestResponse, GrievanceCase, GrievanceStatus } from '@/types';
+import type { IngestPayload, IngestResponse, GrievanceCase, GrievanceStatus, StatusResponse } from '@/types';
 
 class ApiClient {
-  private async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+  public async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
     // 🚨 ALL requests hit the Next.js internal proxy, NEVER FastAPI directly
     const url = `/api${endpoint}`;
 
     const headers = new Headers(options.headers);
     headers.set('Content-Type', 'application/json');
+
+    // 🚨 FIX 1: Attach Global Frontend Security Key
+    if (process.env.NEXT_PUBLIC_FRONTEND_API_KEY) {
+      headers.set('X-Frontend-API-Key', process.env.NEXT_PUBLIC_FRONTEND_API_KEY);
+    }
+
+    // 🚨 FIX 2: Safely inject active sessions from LocalStorage (SSR-Safe)
+    if (typeof window !== 'undefined') {
+      // Check for Citizen Session
+      const citizenSession = localStorage.getItem('civiclink_user_session');
+      if (citizenSession) {
+        try {
+          const parsed = JSON.parse(citizenSession);
+          if (parsed.sessionId) {
+            headers.set('X-Session-ID', parsed.sessionId);
+          }
+        } catch (e) {
+          console.warn("Failed to parse citizen session.");
+        }
+      }
+
+      // Check for Admin JWT Token (For Mission Control)
+      const adminToken = localStorage.getItem('civiclink_admin_token');
+      if (adminToken) {
+        headers.set('Authorization', `Bearer ${adminToken}`);
+      }
+    }
 
     const response = await fetch(url, { ...options, headers });
 
@@ -30,16 +56,8 @@ class ApiClient {
     });
   }
 
-  async getStatus(threadId: string) {
-    return this.request<{
-      status: string;
-      current_state: GrievanceStatus;
-      bot_reply?: string;
-      system_metadata?: any;
-      issue_category?: string;
-      description_text?: string;
-      dispatch_records?: any[];
-    }>(`/v1/status/${threadId}`, { method: 'GET' });
+  async getStatus(threadId: string): Promise<StatusResponse> {
+    return this.request<StatusResponse>(`/v1/status/${threadId}`, { method: 'GET' });
   }
 
   // ==========================================
@@ -149,6 +167,21 @@ class ApiClient {
     return this.request('/v1/admin/settings', {
       method: 'PUT',
       body: JSON.stringify(settings)
+    });
+  }
+
+  // Add inside the ApiClient class:
+  async citizenLogin(username: string, passwordHash: string) {
+    return this.request('/v1/auth/citizen/login', {
+      method: 'POST',
+      body: JSON.stringify({ username, passwordHash }),
+    });
+  }
+
+  async citizenRegister(username: string, passwordHash: string, phone?: string) {
+    return this.request('/v1/auth/citizen/register', {
+      method: 'POST',
+      body: JSON.stringify({ username, passwordHash, phone }),
     });
   }
 }

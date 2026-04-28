@@ -37,7 +37,7 @@ class AsyncRateLimiter:
             await self._db.execute("PRAGMA journal_mode=WAL;")
             await self._db.execute("PRAGMA synchronous=NORMAL;")
             
-            # Create Bucket Schema
+            # 1. Create Bucket Schema
             await self._db.execute("""
                 CREATE TABLE IF NOT EXISTS buckets (
                     id TEXT PRIMARY KEY,
@@ -48,7 +48,7 @@ class AsyncRateLimiter:
                 )
             """)
             
-            # Create Usage Schema for Budgets
+            # 2. Create Usage Schema for Budgets
             await self._db.execute("""
                 CREATE TABLE IF NOT EXISTS usage (
                     id TEXT PRIMARY KEY,
@@ -57,6 +57,19 @@ class AsyncRateLimiter:
                     last_updated TEXT NOT NULL
                 )
             """)
+
+            # 🚨 3. THE FIX: Create Circuit Breakers Schema
+            # Without this, tracking VLM failures crashes the entire fallback chain
+            await self._db.execute("""
+                CREATE TABLE IF NOT EXISTS circuit_breakers (
+                    provider TEXT PRIMARY KEY,
+                    failures INTEGER DEFAULT 0,
+                    last_failure_ns INTEGER,
+                    is_open INTEGER DEFAULT 0,
+                    open_until_ns INTEGER
+                )
+            """)
+            
             logger.info("Native SQLite rate limiter initialized.")
         except Exception as e:
             logger.error(f"Failed to initialize rate limiter DB: {e}")
@@ -92,8 +105,6 @@ class AsyncRateLimiter:
         """, (bucket_id, capacity, now, capacity, refill_rate))
 
         # Step 2: The Atomic Consume Query
-        # This dynamically calculates how many tokens generated since last_refill.
-        # It ONLY updates the row if the calculated tokens >= token_cost.
         query = """
             UPDATE buckets
             SET 
@@ -106,11 +117,11 @@ class AsyncRateLimiter:
         
         cursor = await self._db.execute(query, (now, token_cost, now, bucket_id, now, token_cost))
         
-        # If rowcount == 1, the WHERE clause passed, meaning we had enough tokens.
+        # If rowcount == 1, the WHERE clause passed
         if cursor.rowcount == 1:
             return True, 0.0
 
-        # Step 3: If rejected, calculate how long the user must wait
+        # Step 3: If rejected, calculate wait time
         async with self._db.execute("SELECT tokens, last_refill FROM buckets WHERE id = ?", (bucket_id,)) as cursor:
             row = await cursor.fetchone()
             if row:
@@ -119,7 +130,7 @@ class AsyncRateLimiter:
                 wait_sec = max(0.0, tokens_needed / refill_rate)
                 return False, wait_sec
             
-        return False, 1.0 # Fallback wait time
+        return False, 1.0
 
     async def allow_request(
         self,
@@ -132,14 +143,13 @@ class AsyncRateLimiter:
         now = time.time()
         wait_times = []
 
-        # Dimensions to enforce
         dimensions = [
-            ("global", "all", settings.RATE_LIMIT_BUCKET_SIZE, settings.RATE_LIMIT_REFILL_RATE),
-            ("provider", provider, 
-             getattr(settings, f"{provider.upper()}_RATE_LIMIT_RPM", 30) * 100, 
-             getattr(settings, f"{provider.upper()}_RATE_LIMIT_RPM", 30) * 100 / 60),
-            ("api_key", api_key_hash, settings.RATE_LIMIT_BUCKET_SIZE, settings.RATE_LIMIT_REFILL_RATE),
-        ]
+    ("global", "all", settings.RATE_LIMIT_BUCKET_SIZE * 10, settings.RATE_LIMIT_REFILL_RATE),
+    ("provider", provider, 
+     getattr(settings, f"{provider.upper()}_RATE_LIMIT_RPM", 30) * 100 * 10, 
+     getattr(settings, f"{provider.upper()}_RATE_LIMIT_RPM", 30) * 100 / 60),
+    ("api_key", api_key_hash, settings.RATE_LIMIT_BUCKET_SIZE * 10, settings.RATE_LIMIT_REFILL_RATE),
+]
 
         for dim_name, dim_id, capacity, refill_rate in dimensions:
             bucket_id = self._get_bucket_key(dim_name, dim_id)

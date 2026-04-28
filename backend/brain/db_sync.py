@@ -11,7 +11,7 @@ from typing import Dict, Any
 from envs.ml.Lib import json
 
 from backend.brain.state import CivicLinkState
-from backend.core.db import prisma_client
+from backend.core.db import prisma
 
 logger = logging.getLogger(__name__)
 
@@ -20,8 +20,8 @@ async def sync_state_to_db(state: CivicLinkState) -> None:
     Idempotent sync function. Called by the FastAPI background task 
     after LangGraph pauses or completes an execution step.
     """
-    if not prisma_client.is_connected():
-        await prisma_client.connect()
+    if not prisma.is_connected():
+        await prisma.connect()
 
     session_id = state.get("session_id")
     thread_id = state.get("thread_id")
@@ -59,7 +59,7 @@ async def sync_state_to_db(state: CivicLinkState) -> None:
         
         # A. Upsert Citizen (Using session_id as a hashed identifier)
         phone_hash = hashlib.sha256(session_id.encode()).hexdigest()
-        citizen = await prisma_client.citizen.upsert(
+        citizen = await prisma.citizen.upsert(
             where={"whatsappId": session_id},
             data={
                 "create": {
@@ -73,7 +73,7 @@ async def sync_state_to_db(state: CivicLinkState) -> None:
         )
 
         # B. Upsert Grievance Thread (LangGraph Namespace)
-        thread = await prisma_client.grievancethread.upsert(
+        thread = await prisma.grievancethread.upsert(
             where={"threadId": thread_id},
             data={
                 "create": {
@@ -92,7 +92,7 @@ async def sync_state_to_db(state: CivicLinkState) -> None:
 
         # C. Upsert Grievance Case
         if tracking_id:
-            await prisma_client.grievancecase.upsert(
+            await prisma.grievancecase.upsert(
                 where={"trackingId": tracking_id},
                 data={
                     "create": {
@@ -132,7 +132,7 @@ async def sync_state_to_db(state: CivicLinkState) -> None:
             email = primary_contact.get("officialEmail")
             if email:
                 # Find the jurisdiction row to update
-                existing_jurisdiction = await prisma_client.administrativehierarchy.find_first(
+                existing_jurisdiction = await prisma.administrativehierarchy.find_first(
                     where={
                         "district": jurisdiction.get("district"),
                         "state": jurisdiction.get("state"),
@@ -140,7 +140,7 @@ async def sync_state_to_db(state: CivicLinkState) -> None:
                     }
                 )
                 if existing_jurisdiction:
-                    await prisma_client.administrativehierarchy.update(
+                    await prisma.administrativehierarchy.update(
                         where={"id": existing_jurisdiction.id},
                         data={
                             "officialEmail": email,
@@ -160,7 +160,7 @@ async def sync_state_to_db(state: CivicLinkState) -> None:
             log_id = f"{thread_id}_{log.get('node')}_{log.get('action')}_{log.get('ts')}"
             
             # Fire-and-forget raw SQL insert to easily handle ON CONFLICT DO NOTHING
-            await prisma_client.execute_raw(
+            await prisma.execute_raw(
                 """
                 INSERT INTO audit_events (id, "threadId", node, action, status, payload, "timestamp")
                 VALUES ($1, $2, $3, $4, $5, $6, $7::timestamp)

@@ -13,6 +13,8 @@ import asyncio
 import hashlib
 import logging
 import re
+import time          
+import base64        
 from typing import Dict, Any, Tuple, Optional, List
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -96,74 +98,69 @@ async def close_http_session() -> None:
 # CIRCUIT BREAKER (SQLite-Backed via Rate Limiter)
 # ---------------------------------------------------------
 
-async def _check_circuit_breaker(provider: str) -> bool:
-    """
-    Check circuit breaker status using rate_limiter's SQLite-backed state.
-    Returns True if circuit is OPEN (skip this provider).
-    """
-    # 🚨 FIX 1: Defensive guard against premature execution before DB mounts
-    if not rate_limiter._db:
-        return False  # Fail open if DB isn't mounted yet
-
-    bucket_id = f"circuit:{provider}"
-    now_ns = time.time_ns() # 🚨 FIX 2: Standardized to nanoseconds
-    
-    async with rate_limiter._db.execute(
-        "SELECT tokens, last_refill_ns FROM buckets WHERE id = ?",
-        (bucket_id,)
-    ) as cursor:
-        row = await cursor.fetchone()
-        if not row:
-            return False  # No record = closed
+async def _check_circuit_breaker(provider_name: str) -> bool:
+    """Checks if a provider has been temporarily disabled due to rate limits."""
+    try:
+        from backend.core.rate_limiter import rate_limiter
         
-        tokens, last_refill_ns = row
-        
-        # If tokens <= 0 and timeout hasn't elapsed, circuit is open
-        if tokens <= 0:
-            timeout_sec = getattr(settings, "VLM_CIRCUIT_TIMEOUT", 60)
-            elapsed_sec = (now_ns - last_refill_ns) / 1e9
+        # If rate limiter isn't fully initialized, just allow the request
+        if not hasattr(rate_limiter, '_db') or not rate_limiter._db:
+            return False 
             
-            if elapsed_sec < timeout_sec:
-                return True
-                
-            # Timeout elapsed: reset circuit
-            await rate_limiter._db.execute(
-                "UPDATE buckets SET tokens = 1, last_refill_ns = ? WHERE id = ?",
-                (now_ns, bucket_id)
-            )
-    return False
+        async with rate_limiter._db.execute(
+            "SELECT is_open FROM circuit_breakers WHERE provider = ?", 
+            (provider_name,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return bool(row and row[0])
+            
+    except Exception as e:
+        logger.warning(f"Circuit breaker check failed for {provider_name} (ignoring): {e}")
+        return False
 
-async def _record_provider_failure(provider: str) -> None:
-    """Record failure by depleting circuit breaker bucket."""
-    if not rate_limiter._db:
-        return
+async def _record_provider_failure(provider_name: str):
+    """Records a failure to trip the circuit breaker if necessary."""
+    try:
+        from backend.core.rate_limiter import rate_limiter
+        if not hasattr(rate_limiter, '_db') or not rate_limiter._db:
+            return
+
+        import time
+        now_ns = time.time_ns()
         
-    bucket_id = f"circuit:{provider}"
-    now_ns = time.time_ns()
-    
-    await rate_limiter._db.execute("""
-        INSERT INTO buckets (id, tokens, last_refill_ns, capacity, refill_rate)
-        VALUES (?, 0, ?, 1, 0)
-        ON CONFLICT(id) DO UPDATE SET
-            tokens = 0,
-            last_refill_ns = excluded.last_refill_ns
-    """, (bucket_id, now_ns))
-
+        # We safely execute the circuit breaker update
+        await rate_limiter._db.execute("""
+            INSERT INTO circuit_breakers (provider, failures, last_failure_ns)
+            VALUES (?, 1, ?)
+            ON CONFLICT(provider) DO UPDATE SET
+                failures = failures + 1,
+                last_failure_ns = ?
+        """, (provider_name, now_ns, now_ns))
+        await rate_limiter._db.commit()
+        
+    except Exception as e:
+        logger.warning(f"Ignored DB error while recording VLM failure for {provider_name}: {e}")
+        
 async def _record_provider_success(provider: str) -> None:
     """Record success by resetting circuit breaker bucket."""
-    if not rate_limiter._db:
-        return
+    try:
+        from backend.core.rate_limiter import rate_limiter
+        if not hasattr(rate_limiter, '_db') or not rate_limiter._db:
+            return
+            
+        bucket_id = f"circuit:{provider}"
+        now_ns = time.time_ns()
         
-    bucket_id = f"circuit:{provider}"
-    now_ns = time.time_ns()
-    
-    await rate_limiter._db.execute("""
-        INSERT INTO buckets (id, tokens, last_refill_ns, capacity, refill_rate)
-        VALUES (?, 1, ?, 1, 1)
-        ON CONFLICT(id) DO UPDATE SET
-            tokens = 1,
-            last_refill_ns = excluded.last_refill_ns
-    """, (bucket_id, now_ns))
+        await rate_limiter._db.execute("""
+            INSERT INTO buckets (id, tokens, last_refill_ns, capacity, refill_rate)
+            VALUES (?, 1, ?, 1, 1)
+            ON CONFLICT(id) DO UPDATE SET
+                tokens = 1,
+                last_refill_ns = excluded.last_refill_ns
+        """, (bucket_id, now_ns))
+        await rate_limiter._db.commit()
+    except Exception:
+        pass
 
 # ---------------------------------------------------------
 # 1. SECURE IMAGE INGESTION (Validated + Sanitized)
@@ -176,12 +173,14 @@ MAGIC_BYTES = {
 }
 
 def _validate_image_url(url: str) -> bool:
-    """Validate URL format and allowed domains."""
+    """Validate URL format, allowed domains, or Data URIs."""
+    if url.startswith("data:image"):
+        return True 
+        
     try:
         parsed = urlparse(url)
         if parsed.scheme not in ("https", "http"):
             return False
-        # Optional: restrict to trusted domains
         allowed_domains = getattr(settings, "ALLOWED_IMAGE_DOMAINS", [])
         if allowed_domains and parsed.netloc not in allowed_domains:
             logger.warning(f"Image domain not allowed: {parsed.netloc}")
@@ -189,33 +188,62 @@ def _validate_image_url(url: str) -> bool:
         return True
     except Exception:
         return False
-
 async def _download_image_securely(url: str, session_id: str) -> Tuple[bytes, str]:
-    """Downloads image with URL validation, MIME check, and DoS protection."""
+    """Downloads image or decodes Base64, validates it, and compresses it for the VLM."""
     if not _validate_image_url(url):
-        raise ValueError(f"Invalid or disallowed image URL: {url}")
+        raise ValueError(f"Invalid or disallowed image URL.")
     
-    session = await get_http_session()
-    async with session.get(
-        url, 
-        timeout=aiohttp.ClientTimeout(total=settings.IMAGE_DOWNLOAD_TIMEOUT),
-        headers={"User-Agent": settings.USER_AGENT}
-    ) as response:
-        if response.status != 200:
-            raise ValueError(f"Failed to fetch image: HTTP {response.status}")
-        
-        content_length = response.headers.get('Content-Length')
-        if content_length and int(content_length) > settings.MAX_IMAGE_SIZE:
-            raise ValueError("Image exceeds security limit.")
-        
-        image_bytes = await response.read()
-        magic = image_bytes[:12]
-        detected_mime = next((mime for prefix, mime in MAGIC_BYTES.items() if magic.startswith(prefix)), None)
-        if not detected_mime:
-            raise ValueError("Magic bytes not recognized")
-        
-        return image_bytes, detected_mime
+    image_bytes = b""
+    detected_mime = ""
 
+    # 1. Extract the raw bytes
+    if url.startswith("data:image"):
+        header, encoded = url.split(",", 1)
+        detected_mime = header.split(";")[0].replace("data:", "")
+        image_bytes = base64.b64decode(encoded)
+    else:
+        session = await get_http_session()
+        async with session.get(
+            url, 
+            timeout=aiohttp.ClientTimeout(total=getattr(settings, "IMAGE_DOWNLOAD_TIMEOUT", 10.0)),
+            headers={"User-Agent": getattr(settings, "USER_AGENT", "CivicLink/1.0")}
+        ) as response:
+            if response.status != 200:
+                raise ValueError(f"Failed to fetch image: HTTP {response.status}")
+            
+            image_bytes = await response.read()
+            magic = image_bytes[:12]
+            detected_mime = next((mime for prefix, mime in MAGIC_BYTES.items() if magic.startswith(prefix)), None)
+            if not detected_mime:
+                raise ValueError("Magic bytes not recognized")
+
+    # 2. Security Size Check (10MB Limit)
+    max_size = getattr(settings, "MAX_IMAGE_SIZE", 10 * 1024 * 1024) 
+    if len(image_bytes) > max_size:
+        raise ValueError("Image exceeds 10MB security limit.")
+
+    # 🚨 3. THE TOKEN-SAVER FIX: Compress the image for the Free APIs
+    try:
+        # Open the image using PIL
+        img = Image.open(io.BytesIO(image_bytes))
+        
+        # Convert to RGB (removes alpha channels which some VLMs hate)
+        if img.mode in ('RGBA', 'P'):
+            img = img.convert('RGB')
+            
+        # 🚨 FIX: Hyper-compress the image to bypass Groq's strict free-tier token limits
+        img.thumbnail((800, 800), Image.Resampling.LANCZOS) # Slashed resolution
+        
+        output_buffer = io.BytesIO()
+        img.save(output_buffer, format="JPEG", quality=80) # Slashed quality
+        compressed_bytes = output_buffer.getvalue()
+        
+        return compressed_bytes, "image/jpeg"
+        
+    except Exception as e:
+        logger.warning(f"Failed to compress image, using original: {e}")
+        return image_bytes, detected_mime
+    
 # ---------------------------------------------------------
 # 2. PIXEL FORENSICS (Exception-Isolated)
 # ---------------------------------------------------------
@@ -236,7 +264,7 @@ def _compute_ela(image_bytes: bytes) -> float:
         return float(np.clip(mean_diff * 2, 0.0, 1.0))
     except Exception as e:
         logger.debug(f"ELA computation failed: {e}")
-        return 0.5  # Neutral on error
+        return 0.5  
 
 def _analyze_frequency_domain(image_bytes: bytes) -> float:
     try:
@@ -292,21 +320,14 @@ async def _run_with_provider(
     context: str,
     config: Optional[RunnableConfig] = None
 ) -> Tuple[Dict[str, Any], int]:
-    """
-    Run analysis with a single provider.
-    Returns (result, tokens_used). Cost recorded separately.
-    """
+    """Run analysis with a single provider."""
     token_estimate = await provider.estimate_tokens(image_url, context)
     
-    # Check rate limits with config propagation
     allowed, wait_sec = await provider._check_rate_limit(token_estimate, config)
     if not allowed:
         raise TimeoutError(f"{provider.PROVIDER_NAME} rate limited. Wait {wait_sec:.1f}s")
     
-    # Run analysis with config propagation
     result = await provider.analyze_image(image_url, context, config)
-    
-    # Return tokens for cost calculation
     actual_tokens = getattr(result, "usage", {}).get("total_tokens", token_estimate)
     return result, actual_tokens
 
@@ -316,7 +337,10 @@ async def _fallback_cnn_classifier() -> Dict[str, Any]:
         "is_genuine": True,
         "confidence_score": 0.5,
         "severity": "MEDIUM",
-        "rationale": "fallback_classifier_neutral"
+        "rationale": "fallback_classifier_neutral",
+        "image_description": "The image could not be analyzed due to backend provider failures.",
+        "ai_artifacts": False,
+        "screen_recapture": False
     }
 
 async def _analyze_with_fallback_chain(
@@ -325,22 +349,19 @@ async def _analyze_with_fallback_chain(
     session_id: str,
     config: Optional[RunnableConfig] = None
 ) -> Tuple[Dict[str, Any], int, float, str]:
-    """
-    Try providers in priority order with health checks + circuit breaker.
-    Returns (result, tokens, cost, provider_used).
-    """
-    for provider_name in settings.VLM_PROVIDER_PRIORITY:
-        # Skip if circuit breaker is open
+    """Try providers in priority order with health checks + circuit breaker."""
+    
+    priority_list = getattr(settings, "VLM_PROVIDER_PRIORITY", ["groq"])
+    
+    for provider_name in priority_list:
         if await _check_circuit_breaker(provider_name):
             logger.warning(f"Skipping {provider_name}: circuit breaker open")
             continue
         
         provider = get_provider(provider_name)
         if not provider:
-            logger.debug(f"Provider {provider_name} not configured")
             continue
         
-        # Health check: skip unhealthy providers
         if not await provider.check_health():
             logger.warning(f"Skipping {provider_name}: health check failed")
             continue
@@ -349,26 +370,23 @@ async def _analyze_with_fallback_chain(
             logger.info(f"Attempting analysis with {provider_name}")
             result, tokens = await _run_with_provider(provider, image_url, context, config)
             
-            # Success: record metrics and return
             await _record_provider_success(provider_name)
             provider_counter.add(1, attributes={"provider": provider_name, "status": "success"})
             
-            # Record cost once, here
             cost = provider._calculate_cost(tokens)
-            if settings.ENABLE_COST_TRACKING:
+            if getattr(settings, "ENABLE_COST_TRACKING", False):
                 await provider._record_usage(tokens, cost, config)
                 cost_counter.add(cost, attributes={"provider": provider_name})
             
             return result, tokens, cost, provider_name
             
         except VLMAPIError as e:
-            # Distinguish retryable vs non-retryable errors
             if not e.retryable:
-                logger.warning(f"{provider_name} non-retryable error: {e.message}")
+                # 🚨 FIX: Use str(e) instead of e.message to prevent logging crashes
+                logger.warning(f"{provider_name} non-retryable error: {str(e)}")
                 provider_counter.add(1, attributes={"provider": provider_name, "status": "blocked"})
-                continue  # Try next provider
-            # Retryable: record failure and continue
-            logger.error(f"{provider_name} failed (retryable): {e.message}")
+                continue 
+            logger.error(f"{provider_name} failed (retryable): {str(e)}")
             await _record_provider_failure(provider_name)
             provider_counter.add(1, attributes={"provider": provider_name, "status": "failed"})
             continue
@@ -385,7 +403,6 @@ async def _analyze_with_fallback_chain(
             provider_counter.add(1, attributes={"provider": provider_name, "status": "error"})
             continue
     
-    # All providers failed: use fallback CNN
     logger.warning("All providers failed, using fallback CNN classifier")
     result = await _fallback_cnn_classifier()
     return result, 0, 0.0, "fallback_cnn"
@@ -396,19 +413,15 @@ async def _analyze_with_fallback_chain(
 _PII_KEYWORDS = re.compile(r'\b(aadhaar|pan|phone|mobile|email|address|name)\b', re.I)
 
 def _sanitize_rationale(text: str, max_length: int = 200) -> str:
-    """Sanitize VLM rationale to prevent PII leakage."""
     if not text:
         return ""
-    # Remove potential PII keywords followed by values
     sanitized = _PII_KEYWORDS.sub("[REDACTED_FIELD]", text)
-    # Truncate safely
     return sanitized[:max_length].rsplit(" ", 1)[0] + "..." if len(sanitized) > max_length else sanitized
 
 # ---------------------------------------------------------
 # 5. FUSION WEIGHT VALIDATION (Settings Hook)
 # ---------------------------------------------------------
 def _validate_fusion_weights(weights: Dict[str, float]) -> Dict[str, float]:
-    """Validate and normalize fusion weights to sum to 1.0."""
     total = sum(weights.values())
     if total <= 0:
         logger.error("Fusion weights sum to zero; using defaults")
@@ -421,10 +434,6 @@ def _validate_fusion_weights(weights: Dict[str, float]) -> Dict[str, float]:
 # 6. THE GRAPH NODE (Production-Hardened)
 # ---------------------------------------------------------
 async def vlm_verify_node(state: CivicLinkState, config: RunnableConfig) -> dict:
-    """
-    LangGraph node: Multi-factor image forensics with provider fallback.
-    Returns ONLY state updates. Routing handled by conditional edges.
-    """
     image_url = state.get("image_url")
     if not image_url:
         return {
@@ -433,39 +442,33 @@ async def vlm_verify_node(state: CivicLinkState, config: RunnableConfig) -> dict
 
     session_id = state.get("session_id", "unknown")
     extracted_text = state.get("extracted_text", "")
-    execution_ts = datetime.now(timezone.utc)  # Single timestamp for audit consistency
+    execution_ts = datetime.now(timezone.utc) 
     
     with tracer.start_as_current_span("vlm_verify_node") as span:
         span.set_attribute("session_id", session_id)
         span.set_attribute("image_url_hash", hashlib.sha256(image_url.encode()).hexdigest()[:16])
         
         try:
-            # 1. Secure download with URL validation
             image_bytes, detected_mime = await _download_image_securely(image_url, session_id)
             
-            # 2. Run multi-provider analysis with health-aware fallback chain
             vlm_res, tokens_used, cost_usd, provider_used = await _analyze_with_fallback_chain(
                 image_url, extracted_text, session_id, config
             )
             
-            # 3. Run pixel forensics concurrently (isolated exceptions)
             forensic_results = await asyncio.gather(
                 asyncio.to_thread(_compute_ela, image_bytes),
                 asyncio.to_thread(_analyze_frequency_domain, image_bytes),
                 asyncio.to_thread(_detect_copy_move, image_bytes),
                 asyncio.to_thread(_extract_exif_trust, image_bytes),
-                return_exceptions=True  # Continue even if one fails
+                return_exceptions=True 
             )
             
-            # 🚨 FIX 3: Safely assign array elements before unpacking tuples
             ela_res, freq_res, copy_res, exif_res = forensic_results
             
-            # Handle individual forensic method failures safely
             ela_score = 0.5 if isinstance(ela_res, Exception) else ela_res
             freq_score = 0.5 if isinstance(freq_res, Exception) else freq_res
             copy_move = False if isinstance(copy_res, Exception) else copy_res
             
-            # Safely unpack the EXIF tuple only if it didn't crash
             if isinstance(exif_res, Exception):
                 exif_score = 0.8
             elif isinstance(exif_res, tuple):
@@ -473,15 +476,14 @@ async def vlm_verify_node(state: CivicLinkState, config: RunnableConfig) -> dict
             else:
                 exif_score = 0.8
 
-
-            # 4. Fusion algorithm with validated weights
-            weights = _validate_fusion_weights(settings.FORENSIC_FUSION_WEIGHTS)
+            # 🚨 FIX: Safe fallback for Fusion Weights
+            default_weights = {"vlm": 0.6, "ela": 0.2, "freq": 0.15, "exif": 0.05}
+            weights = _validate_fusion_weights(getattr(settings, "FORENSIC_FUSION_WEIGHTS", default_weights))
             
             ela_trust = 1.0 - min(ela_score * 2, 1.0)
             freq_trust = 1.0 - min(freq_score * 2, 1.0)
             vlm_trust = vlm_res.get("confidence_score", 0.5)
             
-            # Penalty for detected artifacts
             if vlm_res.get("ai_artifacts") or vlm_res.get("screen_recapture") or copy_move:
                 vlm_trust *= 0.3
             
@@ -492,42 +494,42 @@ async def vlm_verify_node(state: CivicLinkState, config: RunnableConfig) -> dict
                 exif_score * weights["exif"]
             )
             
-            # 5. Adaptive thresholding with severity validation
             severity = vlm_res.get("severity", "MEDIUM")
             valid_severities = {"LOW", "MEDIUM", "HIGH", "CRITICAL"}
             if severity not in valid_severities:
-                logger.warning(f"Invalid severity '{severity}'; defaulting to MEDIUM")
                 severity = "MEDIUM"
             
-            threshold = settings.SEVERITY_THRESHOLDS.get(severity)
-            if threshold is None:
-                logger.warning(f"No threshold for severity '{severity}'; using default 0.7")
-                threshold = 0.7
+            # 🚨 FIX: Safe fallback for Severity Thresholds
+            default_thresholds = {"LOW": 0.6, "MEDIUM": 0.7, "HIGH": 0.8, "CRITICAL": 0.9}
+            threshold_map = getattr(settings, "SEVERITY_THRESHOLDS", default_thresholds)
+            threshold = threshold_map.get(severity, 0.7)
             
             is_genuine = final_score >= threshold and vlm_res.get("is_genuine", False)
             
-            # 6. Record metrics
             decision_counter.add(1, attributes={
                 "decision": "genuine" if is_genuine else "suspicious",
                 "severity": severity,
                 "provider": provider_used
             })
             
-            # 7. PII-sanitized, schema-compliant output
             vlm_summary = {
-                "is_genuine": vlm_res.get("is_genuine"),
+                "is_genuine": vlm_res.get("is_genuine", True),
                 "ai_artifacts": vlm_res.get("ai_artifacts", False),
                 "screen_recapture": vlm_res.get("screen_recapture", False),
-                "severity": severity,  # Validated Literal
+                "severity": severity,
                 "rationale": _sanitize_rationale(vlm_res.get("rationale", "")),
+                "image_description": vlm_res.get("image_description", "No description provided."),
                 "provider_used": provider_used
             }
             
-            # 8. Return ONLY state updates (no routing hints)
+            updated_context = extracted_text + f"\n[SYSTEM: VLM analyzed attached image. Description: {vlm_summary['image_description']}]"
+            
             return {
+                "current_status": "PENDING_DETAILS", 
+                "extracted_text": updated_context.strip(),
                 "vlm_output": vlm_summary,
                 "image_authenticity_score": round(final_score, 3),
-                "severity_level": severity,  # Matches state.py Literal
+                "severity_level": severity, 
                 "confidence_metrics": {
                     "vlm_verification": round(vlm_trust, 3),
                     "pixel_forensics": round((ela_trust + freq_trust) / 2, 3),
@@ -549,9 +551,18 @@ async def vlm_verify_node(state: CivicLinkState, config: RunnableConfig) -> dict
             logger.exception(f"Forensics node critical failure: {e}")
             span.record_exception(e)
             
-            # Fail closed: reject suspicious images on error
             return {
+                "current_status": "FAILED",
                 "image_authenticity_score": 0.0,
+                "vlm_output": {
+                    "is_genuine": False,
+                    "ai_artifacts": False,
+                    "screen_recapture": False,
+                    "severity": "MEDIUM",
+                    "rationale": f"System failure during forensics: {type(e).__name__}",
+                    "image_description": "System error: The image could not be analyzed due to a backend failure.",
+                    "provider_used": "error_fallback"
+                },
                 "error_log": [{
                     "node": "vlm_verify",
                     "action": "critical_failure",

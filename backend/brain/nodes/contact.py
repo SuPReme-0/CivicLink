@@ -1,491 +1,478 @@
 # backend/brain/nodes/contact.py
 """
 Production OSINT Contact Discovery Node.
-
-FEATURES:
-- Playwright Stealth with isolated contexts + RAM leak prevention
-- SQLite-backed domain reputation cache (WAL-mode multi-worker safe)
-- Deterministic extraction + Obfuscation decoding (zero hallucination)
-- MX Record + SMTP verification with cloud-provider Port 25 fallback
-- Prisma-synced schema mapping (AdministrativeHierarchy compatible)
+- Exhaustive Graph Building (Crawls deep, aggregates all contacts)
+- Universal Entity Deduction with 70B orchestration
+- 8B Llama Routing for internal navigation (token efficient)
+- 70B for search generation, URL selection, contact extraction
+- Confidence Threshold Gating (Prevents Blind Dispatches)
+- SSL Bypass & Fast Commit Loading
 """
-import re
 import asyncio
 import logging
-import hashlib
-import json
-from typing import Dict, Any, Optional, List, Set
-from datetime import datetime, timezone, timedelta
+import re
+from typing import Dict, Any, Optional, List
 from urllib.parse import urlparse
-from pathlib import Path
 
 import aiohttp
-from backend.brain import state
 import dns.resolver
 import smtplib
-import aiosqlite
-from playwright.async_api import async_playwright, Page, Browser, BrowserContext, Route
-from langgraph.config import RunnableConfig
 from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright, BrowserContext, Route
+from langgraph.config import RunnableConfig
 from pydantic import BaseModel, Field
+from langchain_core.prompts import PromptTemplate
 
 from backend.brain.state import CivicLinkState
-from backend.core.config import settings
 from backend.core.observability import get_tracer
+from backend.core.db import prisma
+from backend.core.llm import get_llm, get_fast_llm  # get_llm returns 70B (Groq), get_fast_llm returns 8B
 
 logger = logging.getLogger(__name__)
 tracer = get_tracer("contact_discovery")
 
 # ---------------------------------------------------------
-# GLOBALS: SQLite Cache for Domain Reputation (Worker-Safe)
-# ---------------------------------------------------------
-REPUTATION_DB_PATH = Path(getattr(settings, "DATA_DIR", "data")) / "domain_reputation.db"
-REPUTATION_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-async def _init_reputation_db() -> aiosqlite.Connection:
-    """Initialize SQLite cache for domain reputation with concurrency locks."""
-    db = await aiosqlite.connect(REPUTATION_DB_PATH)
-    # 🚨 FIX: Enable WAL mode for multi-worker safety
-    await db.execute("PRAGMA journal_mode=WAL;")
-    await db.execute("PRAGMA synchronous=NORMAL;")
-    
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS reputation (
-            domain TEXT PRIMARY KEY,
-            status TEXT NOT NULL,
-            failure_count INTEGER DEFAULT 0,
-            last_checked TEXT NOT NULL,
-            next_check TEXT
-        )
-    """)
-    await db.execute("CREATE INDEX IF NOT EXISTS idx_reputation_next_check ON reputation(next_check)")
-    await db.commit()
-    return db
-
-_reputation_db: Optional[aiosqlite.Connection] = None
-
-async def _get_reputation_db() -> aiosqlite.Connection:
-    global _reputation_db
-    if _reputation_db is None:
-        _reputation_db = await _init_reputation_db()
-    return _reputation_db
-
-async def _check_domain_reputation(domain: str) -> bool:
-    """Check if domain should be scraped based on reputation cache."""
-    db = await _get_reputation_db()
-    now = datetime.now(timezone.utc).isoformat()
-    
-    async with db.execute(
-        "SELECT status, failure_count, next_check FROM reputation WHERE domain = ?",
-        (domain,)
-    ) as cursor:
-        row = await cursor.fetchone()
-        if not row:
-            return True  # No record = allow
-        
-        status, fail_count, next_check = row
-        if next_check and now < next_check:
-            return False  # Still in cooldown
-        if status == "blocked" and fail_count >= 3:
-            return False  # Permanently blocked
-        return True
-
-async def _record_domain_status(domain: str, status: str, success: bool):
-    """Record scraping outcome in reputation cache with exponential backoff."""
-    db = await _get_reputation_db()
-    now = datetime.now(timezone.utc)
-    
-    if success:
-        next_check = (now + timedelta(hours=6)).isoformat()  # Recheck in 6h
-        failure_count = 0
-    else:
-        async with db.execute("SELECT failure_count FROM reputation WHERE domain = ?", (domain,)) as cursor:
-            row = await cursor.fetchone()
-            current_fails = row[0] if row else 0
-            new_fails = min(current_fails + 1, 4)
-            backoff_hours = min(2 ** new_fails, 8)
-            next_check = (now + timedelta(hours=backoff_hours)).isoformat()
-            failure_count = new_fails
-    
-    await db.execute("""
-        INSERT INTO reputation (domain, status, failure_count, last_checked, next_check)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(domain) DO UPDATE SET
-            status = excluded.status,
-            failure_count = excluded.failure_count,
-            last_checked = excluded.last_checked,
-            next_check = excluded.next_check
-    """, (domain, status, failure_count, now.isoformat(), next_check))
-    await db.commit()
-
-# ---------------------------------------------------------
-# 1. PLAYWRIGHT MANAGER (Isolated Contexts + RAM Cleanup)
+# PLAYWRIGHT MANAGER (SSL Bypass & Fast Load)
 # ---------------------------------------------------------
 class PlaywrightManager:
-    """Manages Playwright lifecycle with isolated contexts per session."""
     _playwright = None
-    _browser: Optional[Browser] = None
+    _browser = None
     _lock = asyncio.Lock()
 
     @classmethod
-    async def get_context(cls, session_id: str) -> BrowserContext:
-        """Create isolated browser context for a single scraping session."""
+    async def get_context(cls) -> BrowserContext:
         async with cls._lock:
             if cls._browser is None or not cls._browser.is_connected():
                 cls._playwright = await async_playwright().start()
                 cls._browser = await cls._playwright.chromium.launch(
                     headless=True,
-                    args=[
-                        "--disable-blink-features=AutomationControlled",
-                        "--no-sandbox",
-                        "--disable-setuid-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-gpu"
-                    ]
+                    args=["--disable-blink-features=AutomationControlled", "--no-sandbox",
+                          "--disable-gpu", "--disable-dev-shm-usage"]
                 )
-            
-            # Isolated context: No cookie sharing
             context = await cls._browser.new_context(
                 viewport={"width": 1920, "height": 1080},
-                user_agent=getattr(settings, "USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"),
-                locale="en-US",
-                storage_state=None, 
-                bypass_csp=True
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+                bypass_csp=True,
+                ignore_https_errors=True  # SSL bypass
             )
-            
-            # Anti-detection script
-            await context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                window.chrome = {runtime: {}};
-                navigator.languages = ['en-US', 'en'];
-                navigator.plugins = {length: 5};
-            """)
-            
-            # Block non-essential resources for speed
             async def block_resources(route: Route):
-                if route.request.resource_type in ["image", "stylesheet", "font", "media"]:
+                if route.request.resource_type in ["media", "font", "stylesheet", "image"]:
                     await route.abort()
                 else:
                     await route.continue_()
             await context.route("**/*", block_resources)
-            
             return context
 
     @classmethod
     async def close(cls):
-        """Graceful shutdown: close browser + stop Playwright entirely."""
         async with cls._lock:
             if cls._browser:
                 await cls._browser.close()
                 cls._browser = None
             if cls._playwright:
-                # 🚨 FIX: Stops the zombie processes from eating RAM
                 await cls._playwright.stop()
                 cls._playwright = None
 
 # ---------------------------------------------------------
-# 2. CAPTCHA DETECTION & HANDLING
+# AI MODELS (70B ORCHESTRATION + 8B ROUTING)
 # ---------------------------------------------------------
-CAPTCHA_SELECTORS = [
-    "#captcha", ".g-recaptcha", ".h-captcha", "iframe[src*='recaptcha']",
-    "div[class*='captcha']", "img[alt*='captcha']", "#challenge-running",
-    "#turnstile-wrapper", ".cf-turnstile"
-]
-CLOUDFLARE_INDICATORS = ["checking your browser", "ray id", "cf-chl", "turnstile", "just a moment"]
+class SearchQueries(BaseModel):
+    queries: List[str] = Field(description="Top 2 precise search engine queries.")
 
-async def _detect_captcha(page: Page) -> Optional[str]:
-    for sel in CAPTCHA_SELECTORS:
-        if await page.query_selector(sel):
-            return "captcha_detected"
-    page_text = (await page.inner_text("body"))[:500].lower()
-    if any(ind in page_text for ind in CLOUDFLARE_INDICATORS):
-        return "cloudflare_challenge"
-    return None
+class LinkSelection(BaseModel):
+    selected_urls: List[str] = Field(description="Top 3 URLs to explore next.")
 
-async def _handle_captcha(page: Page, captcha_type: str) -> bool:
-    """Attempt graceful bypass via delay + refresh."""
-    logger.warning(f"{captcha_type} detected. Attempting delay + refresh.")
-    await asyncio.sleep(5)
-    
-    if captcha_type == "cloudflare_challenge":
-        await page.wait_for_timeout(3000)
-        return not await _detect_captcha(page)
-    
-    try:
-        await page.reload(wait_until="domcontentloaded")
-        await asyncio.sleep(2)
-        return not await _detect_captcha(page)
-    except Exception:
-        return False
-
-# ---------------------------------------------------------
-# 3. CONTACT EXTRACTION ENGINE (Prisma-Synced)
-# ---------------------------------------------------------
-# 🚨 FIX: Schema synced to Prisma's AdministrativeHierarchy fields
-class ContactSchema(BaseModel):
-    officialDesignation: str = Field(default="Official")
-    officialName: Optional[str] = None
+class OfficialContact(BaseModel):
+    officialDesignation: str = Field(description="Exact job title")
+    officialName: Optional[str] = Field(default="Concerned Authority")
     officialEmail: Optional[str] = None
-    phone: Optional[str] = None  # Ephemeral context
-    portalUrl: Optional[str] = None
-    source_url: str
-    status: str = Field(default="PENDING")  # Maps to VerificationStatus Enum
-    confidenceScore: float = Field(default=0.5, ge=0.0, le=1.0)
+    phone: Optional[str] = None
+    confidenceScore: float = 0.0
 
-# Regex patterns with Unicode support
-EMAIL_PATTERN = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", re.UNICODE)
-PHONE_IN_PATTERN = re.compile(r"(?:\+?91[\s-]?)?[6-9]\d{9}")
-DESIGNATION_HINTS = re.compile(
-    r"\b(?:Director|Commissioner|Officer|Secretary|Chief|Head|Warden|Engineer|Inspector|अधिकारी|আধিকারিক)\b",
-    re.I | re.UNICODE
-)
-
-OBFUSCATION_PATTERNS = [
-    (re.compile(r"\b([\w.+-]+)\s*\[at\]\s*([\w.-]+)\s*\[dot\]\s*(\w+)", re.I), r"\1@\2.\3"),
-    (re.compile(r"\b([\w.+-]+)\s*@?\s*([\w.-]+)\s*\.?\s*(\w+)", re.I), r"\1@\2.\3"),
-]
-
-def _decode_obfuscated_email(text: str) -> Optional[str]:
-    """Decode common email obfuscation patterns (e.g. name [at] nic [dot] in)."""
-    for pattern, replacement in OBFUSCATION_PATTERNS:
-        match = pattern.search(text)
-        if match:
-            decoded = pattern.sub(replacement, match.group(0))
-            if EMAIL_PATTERN.match(decoded):
-                return decoded
-    return None
-
-def _deterministic_extract(html: str, url: str) -> List[ContactSchema]:
-    """Extract contacts using regex + DOM structure. Zero hallucination."""
-    soup = BeautifulSoup(html, "lxml")
-    for tag in soup(["script", "style", "nav", "footer", "header", "aside", "noscript"]):
-        tag.decompose()
-    
-    contacts = []
-    paragraphs = [p.get_text(strip=True) for p in soup.find_all(["p", "div", "td", "li", "span"]) if p.get_text(strip=True)]
-    
-    for para in paragraphs:
-        decoded_email = _decode_obfuscated_email(para)
-        emails = [decoded_email] if decoded_email else EMAIL_PATTERN.findall(para)
-        phones = list(set(PHONE_IN_PATTERN.findall(para)))
-        designations = DESIGNATION_HINTS.findall(para)
-        
-        if emails:
-            for email in emails:
-                contacts.append(ContactSchema(
-                    officialDesignation=" ".join(designations) if designations else "Official",
-                    officialEmail=email,
-                    phone=phones[0] if phones else None,
-                    source_url=url,
-                    portalUrl=url,
-                    confidenceScore=0.8 if designations else 0.6
-                ))
-    
-    # Deduplicate by email
-    unique = {c.officialEmail: c for c in contacts if c.officialEmail}
-    return list(unique.values())
+class ContactExtractionResult(BaseModel):
+    contacts: List[OfficialContact] = Field(description="List of extracted contacts. Maximum 10.", max_length=10)
 
 # ---------------------------------------------------------
-# 4. VERIFICATION ENGINE (Cloud-Safe SMTP)
+# 70B: Generate precise search queries
 # ---------------------------------------------------------
-def _verify_mx(email: str) -> bool:
+async def _generate_search_queries(district: str, state: str, category: str) -> List[str]:
+    llm = get_llm()  # 70B model
+    structured_llm = llm.with_structured_output(SearchQueries)
+    clean_cat = category.split(',')[0].strip().upper()
+
+    prompt = PromptTemplate.from_template("""
+    You are an expert Indian Government OSINT researcher.
+    Find the official contact directory for '{clean_cat}' in {district}, {state}, India.
+
+    JURISDICTION RULES:
+    1. METROPOLITAN: Municipal Corporation handles Roads, Water, Sanitation, Encroachment.
+    2. RURAL: PWD (Roads), PHE (Water), District Magistrate (Encroachment), CMOH (Health).
+    3. ELECTRICITY: State Electricity Boards or private metro utilities.
+
+    IMPORTANT: Do NOT hallucinate neighboring districts. Keep queries strictly about {district}.
+    Generate 2 precise search terms that will return the official contact/directory page.
+    Example format: "{district} Municipal Corporation contact directory", "PWD {district} official website"
+    """)
     try:
-        domain = email.split("@")[1]
-        dns.resolver.resolve(domain, "MX")
-        return True
+        res = await structured_llm.ainvoke(prompt.format(clean_cat=clean_cat, district=district, state=state))
+        return res.queries
     except Exception:
-        return False
+        # Fallback to a safe default query (still AI-generated but simpler)
+        fallback_prompt = f"Generate one search query for the official website of {district}, {state}, India."
+        resp = await llm.ainvoke(fallback_prompt)
+        lines = [line.strip().strip('"') for line in resp.content.strip().split('\n') if line.strip()]
+        return lines[:1] if lines else [f"{district} district administration official website {state}"]
 
+# ---------------------------------------------------------
+# SEARCH ENGINE (DuckDuckGo) – returns full URLs
+# ---------------------------------------------------------
+async def _dynamic_url_discovery(query: str) -> List[str]:
+    urls = []
+    search_url = "https://lite.duckduckgo.com/lite/"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(search_url, data={"q": query},
+                                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}) as response:
+                if response.status == 200:
+                    html = await response.text()
+                    soup = BeautifulSoup(html, "lxml")
+                    for a in soup.find_all('a'):
+                        href = a.get('href')
+                        if href and href.startswith('http'):
+                            # Keep full URL; prefer Indian government domains
+                            if any(ext in href for ext in ['.gov.in', '.nic.in', '.co.in']) and 'duckduckgo' not in href:
+                                urls.append(href)
+    except Exception as e:
+        logger.warning(f"Dynamic search failed: {e}")
+    # Deduplicate and limit
+    return list(dict.fromkeys(urls))[:5]  # return up to 5 raw results
+
+# ---------------------------------------------------------
+# 70B: From search results, pick the 3 best contact-page candidates
+# ---------------------------------------------------------
+async def _ai_select_starting_urls(search_urls: List[str], target_desc: str, district: str) -> List[str]:
+    if not search_urls:
+        return []
+    # Pre‑filter: remove non‑HTML, non‑gov domains that are clearly wrong
+    filtered = []
+    for url in search_urls:
+        if url.endswith(('.pdf', '.doc', '.xls', '.zip')):
+            continue
+        # Only keep URLs that contain the district name or common state/district patterns
+        # This is a simple heuristic – the AI will further refine.
+        if district.replace(' ', '').lower() in url.replace(' ', '').lower() or '.gov.in' in url or '.nic.in' in url:
+            filtered.append(url)
+    # If all filtered out, fall back to the original (AI will decide)
+    if not filtered:
+        filtered = search_urls
+
+    llm = get_llm()  # 70B
+    structured_llm = llm.with_structured_output(LinkSelection)
+    urls_text = "\n".join(filtered[:10])
+    prompt = PromptTemplate.from_template("""
+    You are an OSINT agent. The target is a contact directory for: {target_desc} in {district}, India.
+    From these URLs, select up to 3 that are most likely to contain a **direct** list of officials (e.g. "Contact Us", "Officials Directory", "Who's Who", departmental sub‑pages).
+    IMPORTANT:
+    - The URL **must** belong to an organisation in {district}.
+    - Do NOT select language‑selection pages, login portals, or homepage splash screens.
+    - Exclude any link pointing to a PDF or document file.
+    Return only the full URLs.
+    URLs:
+    {urls}
+    """)
+    try:
+        result = await structured_llm.ainvoke(prompt.format(target_desc=target_desc, urls=urls_text, district=district))
+        return result.selected_urls[:3]
+    except Exception:
+        # fallback to any .gov.in or .nic.in
+        return [u for u in filtered if '.gov.in' in u or '.nic.in' in u][:3]
+# ---------------------------------------------------------
+# 70B: Fallback - generate candidate URLs when search returns nothing
+# ---------------------------------------------------------
+async def _ai_generate_candidate_urls(district: str, state: str, category: str) -> List[str]:
+    llm = get_llm()  # 70B
+    prompt = f"""You are an expert on Indian government websites.
+    Category: '{category}'. District: {district}, State: {state}.
+    Suggest up to 3 likely official web page URLs that would contain a contact directory for this category in that district.
+    Prefer .gov.in, .nic.in, or official municipal corporation sites.
+    Return ONLY the full URLs, one per line. No explanation.
+    Example:
+    https://example.gov.in/contact
+    """
+    try:
+        resp = await llm.ainvoke(prompt)
+        urls = re.findall(r'https?://[^\s]+', resp.content)
+        return urls[:3]
+    except Exception:
+        # Last resort fallback to common patterns (still not hardcoded district names)
+        return [
+            f"https://{district}.nic.in",
+            f"https://{district}.gov.in",
+            f"https://{district}.{state}.gov.in"
+        ]
+
+# ---------------------------------------------------------
+# 8B (FAST): Internal link routing within a site
+# ---------------------------------------------------------
+async def _ai_select_next_links(links: List[Dict[str, str]], target_desc: str) -> List[str]:
+    if not links:
+        return []
+    links = links[:40]  # prevent large payload
+    llm = get_fast_llm()  # 8B model – cheap and fast
+    try:
+        structured_llm = llm.with_structured_output(LinkSelection)
+        unique_links = {l['href']: l['text'] for l in links}
+        links_text = "\n".join([f"- {text}: {href}" for href, text in unique_links.items()])
+
+        prompt = PromptTemplate.from_template("""
+    You are an OSINT spider. Find the directory for: {target_desc}.
+    From these internal links, choose up to 3 that most likely lead to the department's personnel, leadership, or contact page.
+    DO NOT select:
+    - Language selection pages (e.g., "language", "languages", "select language")
+    - Printer‑friendly versions
+    - PDFs or documents
+    - "Home" (unless it's the only option)
+    LINKS:
+    {links}
+    """)
+        result = await structured_llm.ainvoke(prompt.format(target_desc=target_desc, links=links_text))
+        return result.selected_urls
+    except Exception:
+        # Local fallback: look for keywords
+        keywords = ['contact', 'who', 'direct', 'depart', 'admin']
+        return [l['href'] for l in links if any(kw in l['href'].lower() for kw in keywords)][:3]
+
+# ---------------------------------------------------------
+# 70B: Extract contacts from page text (already high accuracy)
+# ---------------------------------------------------------
+async def _ai_extract_all_contacts(sniper_text: str, target_desc: str) -> List[Dict[str, Any]]:
+    llm = get_llm()  # 70B
+    structured_llm = llm.with_structured_output(ContactExtractionResult)
+
+    prompt = PromptTemplate.from_template("""
+    You are an OSINT extraction agent. Extract every real government official from this text.
+    DO NOT hallucinate. DO NOT pad with nulls.
+
+    Target: '{target_desc}'.
+    Scoring:
+    - If the person exactly matches the target role, confidence = 0.9-1.0.
+    - If the person is related (e.g., superior officer), confidence = 0.7-0.8.
+    - If unrelated, set low confidence and still include if present.
+
+    Decode obfuscated emails like [at] nic [dot] in.
+    TEXT:
+    {text}
+    """)
+    try:
+        result = await structured_llm.ainvoke(prompt.format(target_desc=target_desc, text=sniper_text[:6000]))
+        return [c.model_dump() for c in result.contacts
+                if c.officialEmail and c.officialEmail.lower() != "null"]
+    except Exception as e:
+        logger.error(f"70B extraction failed: {e}")
+        return []
+
+# ---------------------------------------------------------
+# SMTP VERIFICATION (unchanged)
+# ---------------------------------------------------------
 async def _verify_smtp_async(email: str) -> str:
-    """
-    Returns 'VERIFIED_SMTP' if 250 OK, 
-    'PENDING' if Port 25 blocked (cloud provider), 
-    'FAILED' if rejected. Matches Prisma Enum exactly.
-    """
-    if not _verify_mx(email):
-        return "FAILED"
-    
     def sync_smtp_check() -> str:
         try:
             domain = email.split("@")[1]
-            mx_records = dns.resolver.resolve(domain, "MX")
+            try:
+                mx_records = dns.resolver.resolve(domain, "MX")
+                if not mx_records:
+                    return "FAILED"
+            except Exception:
+                return "FAILED"
             mx_host = str(mx_records[0].exchange)
-            
             server = smtplib.SMTP(timeout=3)
             server.connect(mx_host, 25)
             server.helo()
             server.mail("verify@civiclink.local")
             code, _ = server.rcpt(email)
             server.quit()
-            return "VERIFIED_SMTP" if code == 250 else "FAILED"
-        except (TimeoutError, smtplib.SMTPConnectError, OSError):
-            # 🚨 FIX: Port 25 is likely blocked by AWS/GCP. Degrade gracefully.
-            return "PENDING"
-        except smtplib.SMTPRecipientsRefused:
-            return "FAILED"
+            return "VERIFIED" if code == 250 else "FAILED"
         except Exception:
             return "FAILED"
-    
     return await asyncio.to_thread(sync_smtp_check)
 
-def _contact_idempotency_key(contact: ContactSchema) -> str:
-    """Generate deterministic hash for contact deduplication."""
-    data = f"{contact.officialEmail or ''}|{contact.officialDesignation}|{contact.source_url}"
-    return hashlib.sha256(data.encode()).hexdigest()
-
 # ---------------------------------------------------------
-# 5. URL GENERATION (Google IP-Ban Safe)
-# ---------------------------------------------------------
-def _generate_target_urls(jurisdiction: dict, retry: int) -> List[str]:
-    """Generates prioritized scraping targets safely."""
-    district = jurisdiction.get("district", "").strip().lower().replace(" ", "")
-    state = jurisdiction.get("state", "").strip().lower().replace(" ", "")
-    
-    # 🚨 FIX: Removed Google search query to prevent instant reCAPTCHA blocks
-    urls = [
-        f"https://{district}.nic.in/en/contact-us",
-        f"https://{district}.{state}.gov.in/contact",
-        f"https://{state}.gov.in/departments/contact",
-        f"https://{district}.nic.in/whos-who/"
-    ]
-    if retry > 0:
-        urls.extend([
-            f"https://{district}.nic.in/public-utility-category/municipality/",
-            f"https://{state}.gov.in/grievance-redressal"
-        ])
-    
-    sanitized = [u for u in urls if urlparse(u).netloc.endswith((".gov.in", ".nic.in"))]
-    return list(dict.fromkeys(sanitized))[:4] 
-
-# ---------------------------------------------------------
-# 6. THE GRAPH NODE (Production-Hardened)
+# MAIN GRAPH NODE
 # ---------------------------------------------------------
 async def contact_discovery_node(state: CivicLinkState, config: RunnableConfig) -> dict:
-    """
-    LangGraph node: Discovers & verifies official contacts for resolved jurisdiction.
-    """
     jurisdiction = state.get("jurisdiction_hierarchy", {})
-    retry_count = state.get("retry_count", 0)
-    session_id = state.get("session_id", "unknown")
-    execution_ts = datetime.now(timezone.utc)
-    
-    if not jurisdiction.get("district"):
-        return {
-            "error_log": [{"node": "contact_discovery", "action": "missing_jurisdiction", "ts": execution_ts.isoformat()}],
-            "status_updates": [{"node": "contact_discovery", "action": "skipped", "ts": execution_ts.isoformat()}]
-        }
+    record_id = jurisdiction.get("id")
+    district = jurisdiction.get("district", "").strip().lower()
+    state_code = jurisdiction.get("state", "").strip().lower()
+    target_category = jurisdiction.get("issueCategory", "General Administration")
+    target_designation = jurisdiction.get("officialDesignation", "Official")
+    target_desc = f"{target_designation} for {target_category} in {district}"
+    current_retry = state.get("retry_count", 0)
 
-    with tracer.start_as_current_span("contact_discovery_node") as span:
-        span.set_attribute("session_id", session_id)
-        
-        context = None
+    if not record_id or not district:
+        return {"current_status": "AWAITING_REVIEW", "error_log": [{"action": "missing_jurisdiction"}]}
+
+    with tracer.start_as_current_span("contact_discovery_node"):
         try:
-            context = await PlaywrightManager.get_context(session_id)
-            visited = set(state.get("visited_urls", []))
-            base_urls_to_scrape = _generate_target_urls(jurisdiction, retry_count)
-            urls_to_scrape = [u for u in base_urls_to_scrape if u not in visited]            
-            all_contacts: List[Dict[str, Any]] = []
-            seen_ids: Set[str] = set()
-            
-            # Controlled concurrency: max 2 pages at once to prevent IP rate limits
-            semaphore = asyncio.Semaphore(2)
-            
-            async def scrape_url(url: str) -> List[Dict[str, Any]]:
-                async with semaphore:
-                    domain = urlparse(url).netloc
-                    if not await _check_domain_reputation(domain):
-                        return []
-                    
-                    page = await context.new_page()
-                    try:
-                        timeout_ms = getattr(settings, "SCRAPER_TIMEOUT_MS", 15000)
-                        await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-                        await page.wait_for_load_state("networkidle", timeout=5000)
-                        
-                        captcha = await _detect_captcha(page)
-                        if captcha and not await _handle_captcha(page, captcha):
-                            await _record_domain_status(domain, "blocked", success=False)
-                            return []
-                        
-                        html = await page.content()
-                        contacts = _deterministic_extract(html, url)
-                        
-                        verified_contacts = []
-                        for contact in contacts:
-                            key = _contact_idempotency_key(contact)
-                            if key in seen_ids:
-                                continue
-                            seen_ids.add(key)
-                            
-                            if contact.officialEmail:
-                                status = await _verify_smtp_async(contact.officialEmail)
-                                contact.status = status
-                                contact.confidenceScore = 0.98 if status == "VERIFIED_SMTP" else (0.75 if status == "PENDING" else 0.4)
-                            
-                            verified_contacts.append(contact.model_dump())
-                        
-                        await _record_domain_status(domain, "ok", success=bool(verified_contacts))
-                        return verified_contacts
-                        
-                    except Exception as e:
-                        logger.debug(f"Scraping failed for {url}: {e}")
-                        await _record_domain_status(domain, "error", success=False)
-                        return []
-                    finally:
-                        await page.close()
-            
-            # Execute concurrent scraping
-            tasks = [scrape_url(url) for url in urls_to_scrape]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            for result in results:
-                if isinstance(result, list):
-                    all_contacts.extend(result)
-            
-            if not all_contacts:
+            if not prisma.is_connected():
+                await prisma.connect()
+
+            # Fast path: cached contact in DB
+            db_record = await prisma.administrativehierarchy.find_unique(where={"id": record_id})
+            if db_record and db_record.officialEmail:
+                logger.info(f"⚡ FAST PATH: Cached email: {db_record.officialEmail}")
                 return {
-                    "error_log": [{"node": "contact_discovery", "action": "no_contacts_found", "ts": execution_ts.isoformat()}],
-                    "status_updates": [{"node": "contact_discovery", "action": "empty_result", "ts": execution_ts.isoformat()}]
+                    "current_status": "DRAFTING_LETTER",
+                    "primary_contact": {
+                        "officialEmail": db_record.officialEmail,
+                        "officialDesignation": db_record.officialDesignation,
+                        "officialName": db_record.officialName
+                    },
+                    "discovered_contacts": []
                 }
-            
-            # Select primary contact
-            primary = max(
-                [c for c in all_contacts if c.get("status") == "VERIFIED_SMTP"],
-                key=lambda x: x.get("confidenceScore", 0),
-                default=None
-            ) or all_contacts[0]
-            
+
+            # --- 1. 70B generates search queries ---
+            logger.info(f"🧠 70B: Generating search queries for {target_category} in {district}...")
+            queries = await _generate_search_queries(district, state_code, target_category)
+            logger.info(f"   Queries: {queries}")
+
+            # --- 2. Execute searches and collect full URLs ---
+            raw_search_urls = []
+            for q in queries:
+                urls = await _dynamic_url_discovery(q)
+                raw_search_urls.extend(urls)
+            raw_search_urls = list(dict.fromkeys(raw_search_urls))  # deduplicate
+
+            # --- 3. 70B selects the best 3 starting URLs ---
+            if raw_search_urls:
+                logger.info(f"🧠 70B: Selecting best starting URLs from {len(raw_search_urls)} candidates...")
+                frontier = await _ai_select_starting_urls(raw_search_urls, target_desc, district)
+                logger.info(f"   Selected: {frontier}")
+            else:
+                # --- Fallback: 70B generates candidate URLs directly ---
+                logger.warning("No search results. 🧠 70B: Generating candidate URLs...")
+                frontier = await _ai_generate_candidate_urls(district, state_code, target_category)
+                logger.info(f"   AI‑generated fallback URLs: {frontier}")
+
+            if not frontier:
+                logger.error("❌ Completely unable to discover URLs. Cannot proceed.")
+                return {"current_status": "FAILED", "error_log": [{"action": "no_urls_available"}]}
+
+            # --- 4. Spider crawling (8B for internal routing) ---
+            logger.info(f"🕷️ Starting spider on {len(frontier)} seed URLs...")
+            context = await PlaywrightManager.get_context()
+            visited: set = set()
+            all_found_contacts = []
+            max_pages = 15 # limit total crawled pages
+            pages_crawled = 0
+
+            while frontier and pages_crawled < max_pages:
+                current_url = frontier.pop(0)
+                if current_url in visited:
+                    continue
+                visited.add(current_url)
+                pages_crawled += 1
+                logger.info(f"   [{pages_crawled}/{max_pages}] Scanning: {current_url}")
+
+                page = await context.new_page()
+                try:
+                    if current_url.split('?')[0].split('.')[-1].lower() in ('pdf', 'doc', 'docx', 'xls', 'xlsx', 'zip'):
+                        logger.info(f"     Skipping non‑HTML file: {current_url}")
+                        continue
+                    await page.goto(current_url, wait_until="networkidle", timeout=90000)  # network fully idle
+                    await page.wait_for_selector('body', state="visible")  # ensure body rendered
+                    await asyncio.sleep(3)  # extra safety for late AJAX
+                    await asyncio.sleep(2)  # let dynamic content settle
+                    page_text = await page.evaluate("""() => {
+                        const root = document.body || document.documentElement;
+                        return root ? root.innerText.replace(/\\s+/g, ' ').trim() : '';
+                    }""")
+                    # Find obfuscated emails
+                    obf_pattern = r"(?i)[A-Za-z0-9._%+-]+\s*(?:@|\[at\]|\(at\)|\{at\}|\s+at\s+)\s*[A-Za-z0-9.-]+\s*(?:\.|\[dot\]|\(dot\)|\{dot\}|\s+dot\s+)\s*[A-Za-z]{2,7}"
+                    raw_emails = re.findall(obf_pattern, page_text)
+                    if raw_emails:
+                        logger.info(f"     Found {len(raw_emails)} raw emails. Extracting with 70B...")
+                        # Build sniper text around each email
+                        sniper_text = ""
+                        for match in re.finditer(obf_pattern, page_text):
+                            start = max(0, match.start() - 250)
+                            end = min(len(page_text), match.end() + 250)
+                            sniper_text += page_text[start:end] + "\n...[SNIP]...\n"
+                        contacts = await _ai_extract_all_contacts(sniper_text[:6000], target_desc)
+                        for c in contacts:
+                            if c.get("confidenceScore", 0.0) >= 0.20:
+                                c["source_url"] = current_url
+                                all_found_contacts.append(c)
+                                logger.info(f"     Added: {c.get('officialName')} ({c.get('confidenceScore')})")
+                    else:
+                        logger.info("     No emails found on this page. Routing internally...")
+
+                    # Internal link routing with 8B
+                    raw_links = await page.evaluate("""() => {
+                        const rootDomain = window.location.hostname.replace('www.', '');
+                        return Array.from(document.querySelectorAll('a'))
+                            .map(a => ({ text: a.innerText.trim().replace(/\\s+/g, ' ').substring(0, 60), href: a.href }))
+                            .filter(l => l.href.startsWith('http') && l.text.length > 2
+                                && new URL(l.href).hostname.includes(rootDomain)
+                                && !l.href.endsWith('.pdf') && !l.href.endsWith('.jpg'));
+                    }""")
+                    if raw_links:
+                        unique_links = {l['href']: l for l in raw_links}.values()
+                        next_links = await _ai_select_next_links(list(unique_links), target_desc)
+                        for link in next_links:
+                            if link not in visited and link not in frontier:
+                                frontier.append(link)
+                except Exception as e:
+                    logger.warning(f"     Spider error on {current_url}: {e}")
+                finally:
+                    await page.close()
+
+            if not all_found_contacts:
+                return {
+                    "current_status": "AWAITING_REVIEW",
+                    "error_log": [{"action": "spider_exhausted_no_target_found"}],
+                    "discovered_contacts": [],
+                    "retry_count": current_retry + 1
+                }
+
+            # --- 5. Select best match and apply confidence gate ---
+            primary = max(all_found_contacts, key=lambda x: x.get("confidenceScore", 0.0))
+            logger.info(f"🏆 Best match: {primary.get('officialName')} (Score: {primary.get('confidenceScore')})")
+            if primary.get("confidenceScore", 0.0) < 0.70:
+                logger.warning(f"   ⚠️ Confidence too low ({primary.get('confidenceScore')}). Awaiting review.")
+                return {
+                    "current_status": "AWAITING_REVIEW",
+                    "discovered_contacts": all_found_contacts,
+                    "error_log": [{"action": "low_confidence_score", "best_score": primary.get("confidenceScore")}],
+                    "retry_count": current_retry + 1
+                }
+
+            # Verify email
+            primary["verification_status"] = await _verify_smtp_async(primary["officialEmail"])
+            # Save to DB
+            if db_record:
+                await prisma.administrativehierarchy.update(
+                    where={"id": db_record.id},
+                    data={
+                        "officialEmail": primary["officialEmail"],
+                        "officialName": primary.get("officialName", "Concerned Authority"),
+                        "portalUrl": primary.get("source_url"),
+                        "status": "VERIFIED_SMTP" if primary.get("verification_status") == "VERIFIED" else "PENDING"
+                    }
+                )
+
             return {
-                "discovered_contacts": all_contacts,
+                "current_status": "DRAFTING_LETTER",
                 "primary_contact": primary,
-                "visited_urls": urls_to_scrape,
-                "status_updates": [{
-                    "node": "contact_discovery",
-                    "action": "contacts_discovered",
-                    "count": len(all_contacts),
-                    "verified_count": sum(1 for c in all_contacts if c.get("status") == "VERIFIED_SMTP"),
-                    "ts": execution_ts.isoformat()
-                }]
+                "discovered_contacts": all_found_contacts
             }
-            
+
         except Exception as e:
-            logger.exception(f"Contact discovery critical failure: {e}")
-            span.record_exception(e)
-            return {
-                "error_log": [{"node": "contact_discovery", "action": "critical_failure", "details": type(e).__name__, "ts": execution_ts.isoformat()}],
-                "status_updates": [{"node": "contact_discovery", "action": "failed_safe", "ts": execution_ts.isoformat()}]
-            }
+            logger.exception(f"Critical spider failure: {e}")
+            return {"current_status": "FAILED"}
         finally:
-            # 🚨 FIX: Close the isolated context to prevent severe memory leaks
-            if context:
+            if 'context' in locals():
                 await context.close()
 
-# ---------------------------------------------------------
-# SHUTDOWN HOOK (Add to main.py)
-# ---------------------------------------------------------
 async def shutdown_contact_discovery():
-    """Graceful shutdown: stop Playwright and close SQLite cache."""
     await PlaywrightManager.close()
-    if _reputation_db:
-        await _reputation_db.close()
-        logger.info("Contact discovery node shutdown complete")

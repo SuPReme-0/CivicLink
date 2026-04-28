@@ -13,9 +13,14 @@ class Settings(BaseSettings):
     # GLOBAL APPLICATION SETTINGS
     # ==========================================
     PROJECT_NAME: str = "CivicLink Enterprise"
-    VERSION: str = "1.0.0"
+    APP_VERSION: str = "1.0.0" # 🚨 FIXED: Renamed to match main.py
     ENVIRONMENT: str = "development" # 'development' | 'production'
     DEBUG: bool = True
+    
+    # 🚨 ADDED: Missing infrastructure variables required by main.py
+    LOG_LEVEL: str = "INFO"
+    ENABLE_METRICS: bool = True
+    CORS_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000"
     
     # Shared directories & identity
     DATA_DIR: str = "data" 
@@ -33,13 +38,13 @@ class Settings(BaseSettings):
     JWT_SECRET_KEY: str
     JWT_ALGORITHM: str = "HS256"
     
-    # 🚨 NEW: Server-to-Server Auth (Next.js -> FastAPI)
+    # Server-to-Server Auth (Next.js -> FastAPI)
     FRONTEND_API_KEY: str
 
     # ==========================================
     # STAGE 2: MULTI-PROVIDER AI BRAIN
     # ==========================================
-    VLM_PROVIDER_PRIORITY: List[str] = ["gemini", "vllm", "groq"]
+    VLM_PROVIDER_PRIORITY: List[str] = ["groq", "gemini"]  # 🚨 FIXED: Renamed from VLM_PROVIDER_ORDER for clarity
     
     # 1. Gemini Configuration (Primary Vision)
     GEMINI_API_KEY: str = ""
@@ -57,11 +62,13 @@ class Settings(BaseSettings):
     VLLM_MODEL: str = "qwen2.5-vl-7b-instruct"
     
     # 4. Local Embeddings
-    EMBEDDING_MODEL: str = "BAAI/bge-small-en-v1.5"
+    EMBEDDING_MODEL: str = "BAAI/bge-m3"
 
     # ==========================================
     # FORENSICS & RATE LIMITING
     # ==========================================
+    VLLM_TIMEOUT: float = 10.0
+    FORENSIC_FUSION_WEIGHTS: dict = {"vlm": 0.6, "ela": 0.2, "freq": 0.15, "exif": 0.05}
     SEVERITY_THRESHOLDS: Dict[str, float] = {
         "LOW": 0.6, "MEDIUM": 0.7, "HIGH": 0.8, "CRITICAL": 0.9 
     }
@@ -100,7 +107,6 @@ class Settings(BaseSettings):
     # ==========================================
     # STAGE 5b: DISPATCH CONFIGURATION (SMTP)
     # ==========================================
-    # 🚨 NEW: Mapped from your .env
     SMTP_HOST: str = "smtp.gmail.com"
     SMTP_PORT: int = 587
     SMTP_USERNAME: str

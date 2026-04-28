@@ -3,50 +3,59 @@
 # ==========================================
 
 # --- CORE & API ---
-fastapi>=0.110.1          
-uvicorn[standard]>=0.29.0 
-pydantic>=2.7.0           
-pydantic-settings>=2.2.1  # Required for SettingsConfigDict
+fastapi>=0.115.0          
+uvicorn[standard]>=0.30.0 
+pydantic>=2.9.0           
+pydantic-settings>=2.5.0  
 python-dotenv>=1.0.1      
 
-# --- DATABASE & ORM (Stage 1) ---
-prisma>=0.13.1            # CRITICAL: Our actual ORM. 
+# --- DATABASE & ORM ---
+prisma>=0.15.0            
 
-# --- LANGGRAPH & AI BRAIN (Stage 2) ---
-langgraph>=0.0.35         
-langchain-core>=0.1.45    
-google-generativeai>=0.7.0 
-groq>=0.9.0               
-openai>=1.35.0            # For vLLM
+# --- LANGGRAPH & AI BRAIN ---
+langgraph>=0.2.28                     # 🚨 UPGRADED: v0.2+ handles async interrupts properly
+langgraph-checkpoint-postgres>=2.0.0  # 🚨 UPGRADED: Matches new LangGraph API
+psycopg[binary]>=3.1.19               
+langchain-core>=0.3.5                 # 🚨 UPGRADED: v0.3+ architecture
+groq>=0.11.0               
+openai>=1.50.0             
+google-genai>=0.1.2                   # 🚨 FIXED: Replaced deprecated google-generativeai SDK
+
+# --- LOCAL EMBEDDINGS & RAG (Jurisdiction Node) ---
+sentence-transformers>=3.1.1          # 🚨 ADDED: Required for BAAI/bge-small RAG
+# Note: PyTorch should be installed separately via explicit index-url for GPU support
 
 # --- FORENSICS & IMAGE PROCESSING ---
-pillow>=10.3.0            
-opencv-python-headless>=4.9.0 
-numpy>=1.26.0             
-aiohttp>=3.9.5            
+pillow>=10.4.0            
+opencv-python-headless>=4.10.0 
+numpy>=1.26.4             
+aiohttp>=3.10.5           
 
 # --- OBSERVABILITY & RATE LIMITING ---
-aiosqlite>=0.20.0         # Rate Limiter & Dispatch Cache
-tenacity>=8.2.3          
-opentelemetry-api>=1.24.0 
-opentelemetry-sdk>=1.24.0 
+aiosqlite>=0.20.0         
+tenacity>=8.5.0          
+opentelemetry-api>=1.27.0 
+opentelemetry-sdk>=1.27.0 
+opentelemetry-instrumentation-fastapi>=0.48b0 
+opentelemetry-exporter-otlp-proto-grpc>=1.27.0
 prometheus-fastapi-instrumentator>=7.0.0 
 
-# --- WEB SCRAPING & VERIFICATION (Stage 3 & 4) ---
-playwright>=1.43.0        
+# --- WEB SCRAPING & VERIFICATION ---
+playwright>=1.47.0        
 beautifulsoup4>=4.12.3    
-lxml>=5.2.1               
-dnspython>=2.6.1          
-async-lru>=2.0.4          # For Jurisdiction caching
+lxml>=5.3.0               
+dnspython>=2.7.0          
+async-lru>=2.0.4          
 
-# --- DISPATCH LAYER (Stage 5b) ---
-aiosmtplib>=3.0.1         # Async SMTP execution
-dkimpy>=1.1.6             # DKIM Cryptographic signing
+# --- DISPATCH LAYER ---
+aiosmtplib>=3.0.2         
+dkimpy>=1.1.8             
 
 # --- SECURITY & CRYPTOGRAPHY ---
-cryptography>=42.0.5      
-pyjwt>=2.8.0              
-passlib[bcrypt]>=1.7.4    
+cryptography>=43.0.1      
+pyjwt>=2.9.0              
+bcrypt>=4.2.0             # 🚨 FIXED: Dropped Passlib (unmaintained) for modern bcrypt
 
 # --- ASYNC WORKERS ---
-celery>=5.3.6
+celery>=5.4.0
+redis>=5.1.0              # 🚨 ADDED: Required as the message broker for Celery

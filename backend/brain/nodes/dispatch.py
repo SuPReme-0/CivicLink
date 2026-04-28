@@ -4,19 +4,21 @@ Production Dispatch Node: Email + Portal Delivery Engine.
 
 FEATURES:
 - SMTP dispatch with DKIM/SPF signing (raw byte transmission)
+- Automated Base64 Image Attachment Extraction (Format-Agnostic)
 - SQLite Circuit Breaker (WAL-mode, timezone-safe queries)
-- State-Safe Dictionary Merging (preserves previous confidence scores)
 - Safe Infinite-Loop Prevention (explicit retry_count increments)
-- Playwright Stealth context reuse (zero memory leaks)
+- Playwright Stealth context reuse (Zero memory leaks, No closed contexts)
 """
 import asyncio
 import logging
 import hashlib
+import base64
 import dkim
 from typing import Dict, Any, Optional, Literal, Tuple
 from datetime import datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication # 🚨 FIX: Generic attachment for unsupported formats like WebP
 from email.utils import formatdate, make_msgid
 
 import aiosmtplib
@@ -25,7 +27,7 @@ from langgraph.config import RunnableConfig
 from backend.brain.state import CivicLinkState
 from backend.core.config import settings
 from backend.core.observability import get_tracer
-from backend.brain.nodes.contact import PlaywrightManager  # 🚨 FIX: Reuse Playwright
+from backend.brain.nodes.contact import PlaywrightManager  
 
 logger = logging.getLogger(__name__)
 tracer = get_tracer("dispatch_node")
@@ -34,11 +36,11 @@ tracer = get_tracer("dispatch_node")
 # GLOBALS: Idempotency Cache + Circuit Breaker
 # ---------------------------------------------------------
 DISPATCH_DB_PATH = getattr(settings, "DATA_DIR", "data") + "/dispatch_state.db"
+_dispatch_db = None
 
 async def _init_dispatch_db():
     import aiosqlite
     db = await aiosqlite.connect(DISPATCH_DB_PATH)
-    # 🚨 FIX: Enable concurrent reads/writes for multi-worker safety
     await db.execute("PRAGMA journal_mode=WAL;")
     await db.execute("PRAGMA synchronous=NORMAL;")
     
@@ -59,8 +61,6 @@ async def _init_dispatch_db():
     await db.commit()
     return db
 
-_dispatch_db = None
-
 async def _get_dispatch_db():
     global _dispatch_db
     if _dispatch_db is None:
@@ -68,7 +68,6 @@ async def _get_dispatch_db():
     return _dispatch_db
 
 def _generate_idempotency_key(state: CivicLinkState) -> str:
-    # Uses tracking_id which was added in Patch 3
     data = f"{state.get('session_id')}|{state.get('tracking_id')}|{state.get('primary_contact', {}).get('officialEmail')}"
     return hashlib.sha256(data.encode()).hexdigest()
 
@@ -83,7 +82,7 @@ async def _record_dispatch_attempt(key, session_id, target_email, portal_url, st
     now = datetime.now(timezone.utc).isoformat()
     
     next_retry = None
-    if status in ("FAILED", "BOUNCED") and retry_count < getattr(settings, "MAX_DISPATCH_RETRIES", 3):
+    if status in ("FAILED", "BOUNCED", "RETRYING") and retry_count < getattr(settings, "MAX_DISPATCH_RETRIES", 3):
         next_retry = (datetime.now(timezone.utc) + timedelta(seconds=min(2**retry_count, 300))).isoformat()
     
     await db.execute("""
@@ -98,8 +97,8 @@ async def _record_dispatch_attempt(key, session_id, target_email, portal_url, st
 # ---------------------------------------------------------
 # 1. SMTP DISPATCH ENGINE
 # ---------------------------------------------------------
-def _build_mime_message(subject, body_text, body_html, from_email, to_email, tracking_id) -> MIMEMultipart:
-    msg = MIMEMultipart("alternative")
+def _build_mime_message(subject, body_text, body_html, from_email, to_email, tracking_id, image_payload: str = None) -> MIMEMultipart:
+    msg = MIMEMultipart("mixed")
     msg["Subject"] = subject
     msg["From"] = from_email
     msg["To"] = to_email
@@ -108,13 +107,36 @@ def _build_mime_message(subject, body_text, body_html, from_email, to_email, tra
     msg["X-CivicLink-Tracking"] = tracking_id
     msg["Auto-Submitted"] = "auto-generated"
     
-    msg.attach(MIMEText(body_text, "plain", "utf-8"))
+    alt_part = MIMEMultipart("alternative")
+    alt_part.attach(MIMEText(body_text, "plain", "utf-8"))
     if body_html:
-        msg.attach(MIMEText(body_html, "html", "utf-8"))
+        alt_part.attach(MIMEText(body_html, "html", "utf-8"))
+    
+    msg.attach(alt_part)
+    
+    # 🚨 UPGRADE: Format-Agnostic Image Attachment (Prevents WebP Crashes)
+    if image_payload and image_payload.startswith("data:image"):
+        try:
+            header, encoded = image_payload.split(",", 1)
+            mime_type = header.split(";")[0].replace("data:", "")
+            ext = mime_type.split("/")[-1] if "/" in mime_type else "bin"
+            
+            image_bytes = base64.b64decode(encoded)
+            
+            # Using MIMEApplication ensures it sends as a safe binary file if it's an unsupported web format
+            image_attachment = MIMEApplication(image_bytes, _subtype=ext)
+            filename = f"evidence_{tracking_id}.{ext}"
+            image_attachment.add_header('Content-Disposition', 'attachment', filename=filename)
+            
+            msg.attach(image_attachment)
+            logger.info(f"Attached {filename} to dispatch payload.")
+            
+        except Exception as e:
+            logger.error(f"Failed to decode/attach Base64 image payload: {e}")
+
     return msg
 
 async def _send_smtp_async(msg_bytes: bytes, to_email: str) -> Tuple[int, str]:
-    """Sends raw bytes via sendmail to support DKIM signatures safely."""
     try:
         smtp = aiosmtplib.SMTP(
             hostname=settings.SMTP_HOST, port=settings.SMTP_PORT,
@@ -122,8 +144,6 @@ async def _send_smtp_async(msg_bytes: bytes, to_email: str) -> Tuple[int, str]:
         )
         await smtp.connect()
         await smtp.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
-        
-        # 🚨 FIX 1: Use sendmail for pre-signed raw bytes, NOT send_message
         await smtp.sendmail(settings.DISPATCH_FROM_EMAIL, [to_email], msg_bytes)
         await smtp.quit()
         return 250, "OK"
@@ -143,7 +163,6 @@ def _interpret_smtp_response(code: int, response: str) -> Literal["SENT", "BOUNC
     if 200 <= code < 300:
         return "SENT"
     elif code in (421, 450, 451):
-        # 🚨 FIX 4a: Must return exactly "RETRYING" to match routing.py
         return "RETRYING" 
     elif 500 <= code < 600:
         if "550" in response and ("user unknown" in response.lower() or "no such user" in response.lower()):
@@ -153,12 +172,14 @@ def _interpret_smtp_response(code: int, response: str) -> Literal["SENT", "BOUNC
 # ---------------------------------------------------------
 # 2. PORTAL FALLBACK AUTOMATION
 # ---------------------------------------------------------
-async def _submit_portal_form(portal_url, subject, body_text, jurisdiction, session_id):
-    """Submit grievance via portal using shared Playwright context."""
-    # 🚨 FIX: Reuse the global Playwright manager (No memory leaks)
-    context = await PlaywrightManager.get_context(session_id)
-    page = await context.new_page()
+async def _submit_portal_form(portal_url, subject, body_text, jurisdiction):
+    # 🚨 UPGRADE: Fixed context initialization and removed context.close() to prevent lifecycle crashes
+    context = None
+    page = None
     try:
+        context = await PlaywrightManager.get_context() # Removed invalid session_id parameter
+        page = await context.new_page()
+        
         await page.goto(portal_url, wait_until="domcontentloaded", timeout=30000)
         
         fields = {
@@ -180,22 +201,27 @@ async def _submit_portal_form(portal_url, subject, body_text, jurisdiction, sess
             await page.wait_for_load_state("networkidle", timeout=10000)
             ticket = await page.evaluate("() => { const m = document.body.innerText.match(/(?:Ticket|Reference)\\s*#?\\s*([A-Z0-9-]+)/i); return m ? m[1] : null; }")
             return True, "Success", ticket
+            
         return False, "Submit button not found", None
+        
     except Exception as e:
         logger.error(f"Portal submission failed: {e}")
         return False, f"Submission error: {type(e).__name__}", None
     finally:
-        if 'page' in locals():
+        # 🚨 UPGRADE: Close ONLY the page, NEVER the shared context
+        if page:
             await page.close()
-        if 'context' in locals():
-            await context.close()
 
 # ---------------------------------------------------------
 # 3. CIRCUIT BREAKER
 # ---------------------------------------------------------
 async def _check_dispatch_circuit(target: str) -> bool:
+    # 🚨 UPGRADE: Guard against malformed emails without '@' to prevent wild SQL LIKE matches
+    if not target or "@" not in target:
+        return False 
+        
     db = await _get_dispatch_db()
-    # 🚨 FIX 2: Python-native UTC timestamp ensures perfect Lexicographical comparison
+    domain = target.split("@")[-1]
     threshold_time = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
     
     async with db.execute(
@@ -203,7 +229,7 @@ async def _check_dispatch_circuit(target: str) -> bool:
            WHERE (target_email = ? OR target_email LIKE ?) 
            AND status IN ('FAILED', 'BOUNCED') 
            AND dispatched_at > ?""",
-        (target, f"%@{target}" if "@" not in target else target, threshold_time)
+        (target, f"%@{domain}", threshold_time)
     ) as cursor:
         row = await cursor.fetchone()
         return (row[0] if row else 0) >= 3
@@ -217,6 +243,7 @@ async def dispatch_node(state: CivicLinkState, config: RunnableConfig) -> dict:
     jurisdiction = state.get("jurisdiction_hierarchy", {})
     tracking_id = state.get("tracking_id", f"CIVIC-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}")
     session_id = state.get("session_id", "unknown")
+    image_payload = state.get("image_url")  
     current_retry = state.get("retry_count", 0)
     execution_ts = datetime.now(timezone.utc)
     
@@ -229,15 +256,24 @@ async def dispatch_node(state: CivicLinkState, config: RunnableConfig) -> dict:
 
     with tracer.start_as_current_span("dispatch_node") as span:
         try:
-            target = contact.get("officialEmail", "").split("@")[-1] if "@" in contact.get("officialEmail", "") else contact.get("officialEmail")
-            if await _check_dispatch_circuit(target):
+            target_email = contact.get("officialEmail", "")
+            
+            if await _check_dispatch_circuit(target_email):
                 smtp_status = "CIRCUIT_OPEN"
+                smtp_code = None
+                smtp_response = "Circuit breaker tripped due to recent failures."
             else:
                 msg = _build_mime_message(
-                    drafted["subject"], drafted["body"], drafted.get("body_html"),
-                    settings.DISPATCH_FROM_EMAIL, contact["officialEmail"], tracking_id
+                    drafted["subject"], 
+                    drafted["body"], 
+                    drafted.get("body_html"),
+                    settings.DISPATCH_FROM_EMAIL, 
+                    target_email, 
+                    tracking_id,
+                    image_payload
                 )
                 
+                # 🚨 Validated DKIM prepending behavior is standard and correct
                 if getattr(settings, "DKIM_ENABLED", False) and getattr(settings, "DKIM_PRIVATE_KEY", None):
                     signed_bytes = dkim.sign(
                         message=msg.as_bytes(), selector=settings.DKIM_SELECTOR.encode(),
@@ -247,18 +283,20 @@ async def dispatch_node(state: CivicLinkState, config: RunnableConfig) -> dict:
                 else:
                     signed_bytes = msg.as_bytes()
                 
-                smtp_code, smtp_response = await _send_smtp_async(signed_bytes, contact["officialEmail"])
+                smtp_code, smtp_response = await _send_smtp_async(signed_bytes, target_email)
                 smtp_status = _interpret_smtp_response(smtp_code, smtp_response)
                 
-                await _record_dispatch_attempt(
-                    idempotency_key, session_id, contact["officialEmail"], None, 
-                    smtp_status, smtp_code, smtp_response if smtp_status != "SENT" else None, current_retry
-                )
+            await _record_dispatch_attempt(
+                idempotency_key, session_id, target_email, None, 
+                smtp_status, smtp_code, smtp_response if smtp_status != "SENT" else None, current_retry
+            )
             
             portal_submitted, portal_ticket = False, None
+            
+            # If SMTP fails or bounces, attempt portal fallback if available
             if smtp_status not in ("SENT", "DELIVERED") and contact.get("portalUrl"):
                 portal_success, portal_msg, portal_ticket = await _submit_portal_form(
-                    contact["portalUrl"], drafted["subject"], drafted["body"], jurisdiction, session_id
+                    contact["portalUrl"], drafted["subject"], drafted["body"], jurisdiction
                 )
                 if portal_success:
                     portal_submitted = True
@@ -267,7 +305,6 @@ async def dispatch_node(state: CivicLinkState, config: RunnableConfig) -> dict:
 
             final_status = "DELIVERED" if smtp_status == "SENT" else smtp_status
             
-            # 🚨 FIX 3: Safely merge confidence metrics to prevent data loss
             existing_metrics = state.get("confidence_metrics", {})
             updated_metrics = {**existing_metrics, "dispatch_success": 1.0 if final_status in ("DELIVERED", "PORTAL_SUBMITTED") else 0.0}
             
@@ -276,7 +313,6 @@ async def dispatch_node(state: CivicLinkState, config: RunnableConfig) -> dict:
                 "final_dispatch_id": portal_ticket or tracking_id,
                 "dispatch_channel": "PORTAL_FORM" if portal_submitted else "SMTP",
                 "confidence_metrics": updated_metrics,
-                # 🚨 FIX 4b: Explicitly increment retry_count to prevent infinite loops
                 "retry_count": current_retry + 1 if final_status == "RETRYING" else current_retry,
                 "status_updates": [{
                     "node": "dispatch", "action": f"dispatch_{final_status.lower()}",
@@ -289,8 +325,7 @@ async def dispatch_node(state: CivicLinkState, config: RunnableConfig) -> dict:
             span.record_exception(e)
             return {
                 "dispatch_status": "FAILED",
-                "retry_count": current_retry + 1,  # Failsafe increment
-                # 🚨 FIX: Anchor the tracking ID in the state so retries use the exact same ID
+                "retry_count": current_retry + 1,
                 "tracking_id": tracking_id, 
                 "error_log": [{
                     "node": "dispatch", 

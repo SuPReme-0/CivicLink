@@ -43,6 +43,10 @@ class CivicLinkState(TypedDict, total=False):
     max_retries: int
     requires_human_review: bool   # Explicit interrupt flag for Gatekeeper
 
+    # 🚨 NEW: Conversational Memory Fields
+    is_grievance_complete: bool
+    conversational_reply: Optional[str]
+    
     # ---------------------------------------------------------
     # 2. THE INGESTION & ZERO-TRUST VAULT
     # ---------------------------------------------------------

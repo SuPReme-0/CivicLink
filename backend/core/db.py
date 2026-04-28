@@ -9,17 +9,16 @@ from prisma import Prisma
 
 logger = logging.getLogger(__name__)
 
-# The Global Singleton
-prisma_client = Prisma()
+prisma = Prisma()
 
 async def connect_db() -> None:
     """To be called in the FastAPI lifespan startup event."""
-    if not prisma_client.is_connected():
-        await prisma_client.connect()
+    if not prisma.is_connected():
+        await prisma.connect()
         logger.info("Prisma database client connected successfully.")
 
 async def disconnect_db() -> None:
     """To be called in the FastAPI lifespan shutdown event."""
-    if prisma_client.is_connected():
-        await prisma_client.disconnect()
+    if prisma.is_connected():
+        await prisma.disconnect()
         logger.info("Prisma database client disconnected.")

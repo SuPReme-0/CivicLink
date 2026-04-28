@@ -2,58 +2,62 @@
 """
 CivicLink Master LangGraph Orchestrator.
 Compiles the state machine, wires the conditional edges, and mounts the 
-Async PostgreSQL checkpointer with connection pooling.
+checkpointer for conversational memory.
 """
 import logging
-from contextlib import asynccontextmanager
-from typing import Any, AsyncGenerator
-
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-from psycopg_pool import AsyncConnectionPool
+from langgraph.checkpoint.memory import MemorySaver
 
 from backend.core.config import settings
 from backend.brain.state import CivicLinkState
 from backend.brain.routing import ROUTING_EDGES
 
-# Import the nodes we've built (and placeholders for the ones we haven't)
+# 🚨 IMPORTING THE REAL PRODUCTION NODES
+from backend.brain.nodes.verification_gate import verification_gate_node # 🚨 ADD THIS
 from backend.brain.nodes.ingest_node import ingest_node
 from backend.brain.nodes.vlm_verify import vlm_verify_node
-# from backend.brain.nodes.jurisdiction import resolve_jurisdiction_node
-# from backend.brain.nodes.contact import discover_contact_node
-# from backend.brain.nodes.drafting import draft_letter_node
-# from backend.brain.nodes.gatekeeper import verification_gate_node
-# from backend.brain.nodes.dispatch import dispatch_node
+from backend.brain.nodes.jurisdiction import resolve_jurisdiction_node
+from backend.brain.nodes.contact import contact_discovery_node
+from backend.brain.nodes.drafting import drafting_node
+from backend.brain.nodes.dispatch import dispatch_node
 
 logger = logging.getLogger(__name__)
 
-# --- Placeholder Nodes (To be replaced as we build them) ---
-async def dummy_node(state: CivicLinkState) -> dict:
+# =============================================================================
+# 🚧 PENDING NODES (To be built next)
+# =============================================================================
+
+async def human_review_node(state: CivicLinkState) -> dict:
+    """
+    This node does nothing computationally. It acts as an anchor for the LangGraph interrupt.
+    The graph pauses BEFORE this node, and resumes when an Admin updates the state.
+    """
     return {}
 
-# ---------------------------------------------------------
-# 1. GRAPH CONSTRUCTION
-# ---------------------------------------------------------
-def build_graph_definition() -> StateGraph:
-    """Defines the nodes and edges without compiling the checkpointer."""
+# =============================================================================
+# 🏗️ GRAPH CONSTRUCTION & COMPILATION
+# =============================================================================
+def build_civiclink_graph():
+    """
+    Defines nodes, wires conditional edges, and compiles the workflow.
+    """
     workflow = StateGraph(CivicLinkState)
     
-    # Add Nodes
+    # 1. Register Nodes
     workflow.add_node("ingest", ingest_node)
     workflow.add_node("vlm_verify", vlm_verify_node)
-    workflow.add_node("resolve_jurisdiction", dummy_node) # Pending
-    workflow.add_node("discover_contact", dummy_node)     # Pending
-    workflow.add_node("draft_letter", dummy_node)         # Pending
-    workflow.add_node("verification_gate", dummy_node)    # Pending
-    workflow.add_node("dispatch", dummy_node)             # Pending
+    workflow.add_node("resolve_jurisdiction", resolve_jurisdiction_node)
+    workflow.add_node("discover_contact", contact_discovery_node)
+    workflow.add_node("draft_letter", drafting_node)
+    workflow.add_node("verification_gate", verification_gate_node)
+    workflow.add_node("human_review", human_review_node)
+    workflow.add_node("dispatch", dispatch_node)
     
-    # Human Review is a dummy node because the logic happens externally via API
-    workflow.add_node("human_review", dummy_node) 
-    
-    # Set Entry Point
+    # 2. Set Entry Point (Every user message hits ingest first)
     workflow.set_entry_point("ingest")
     
-    # Wire Conditional Edges
+    # 3. Wire Conditional Edges using our Central Routing Registry
+    # This ensures every node has a fail-safe fallback to Human Review
     workflow.add_conditional_edges("ingest", ROUTING_EDGES["ingest"])
     workflow.add_conditional_edges("vlm_verify", ROUTING_EDGES["vlm_verify"])
     workflow.add_conditional_edges("resolve_jurisdiction", ROUTING_EDGES["resolve_jurisdiction"])
@@ -63,37 +67,15 @@ def build_graph_definition() -> StateGraph:
     workflow.add_conditional_edges("dispatch", ROUTING_EDGES["dispatch"])
     workflow.add_conditional_edges("human_review", ROUTING_EDGES["human_review"])
     
-    return workflow
-
-# ---------------------------------------------------------
-# 2. ASYNC CHECKPOINTER & COMPILATION
-# ---------------------------------------------------------
-@asynccontextmanager
-async def get_compiled_graph() -> AsyncGenerator[Any, None]:
-    """
-    Context manager that yields the fully compiled, database-backed LangGraph.
-    Manages the AsyncConnectionPool lifecycle safely.
-    """
-    connection_string = settings.DATABASE_URL
+    # 4. Initialize Synchronous Checkpointer (Memory)
+    memory = MemorySaver()
     
-    # Initialize a connection pool for the async checkpointer
-    async with AsyncConnectionPool(
-        conninfo=connection_string,
-        max_size=10,
-        kwargs={"autocommit": True, "prepare_threshold": 0}
-    ) as pool:
-        
-        checkpointer = AsyncPostgresSaver(pool)
-        
-        # Ensure the LangGraph checkpoint tables exist in the DB
-        await checkpointer.setup()
-        
-        workflow = build_graph_definition()
-        
-        # Compile with the checkpointer and the explicit HITL interrupt
-        compiled_graph = workflow.compile(
-            checkpointer=checkpointer,
-            interrupt_before=["human_review"] # 🚨 LangGraph-native HITL pause
-        )
-        
-        yield compiled_graph
+    # 5. Compile Graph with HARD INTERRUPTS
+    compiled_graph = workflow.compile(
+        checkpointer=memory,
+        # 🚨 This physically locks the background thread from executing any further 
+        # until an Admin explicitly resumes it via the /admin API.
+        interrupt_before=["human_review"] 
+    )
+    
+    return compiled_graph

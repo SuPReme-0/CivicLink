@@ -16,19 +16,19 @@ export type GrievanceStatus =
   | 'REJECTED_FRAUD'     // Added: flagged as fake/spam
   | 'ESCALATED';         // Added: forwarded to higher authority
 
-export interface LocationData {
-  lat: number;
-  lon: number;
-  type: 'gps' | 'text';  // Required field
-  address_text?: string;
-}
-
-export interface IngestPayload {
+  export interface IngestPayload {
   phone_number: string;
   thread_id: string;
   text_message: string;
-  image_url?: string;    // URL or base64 data URL for prototype
-  location: LocationData;
+  image_url?: string;      // ✅ Now optional
+  location?: LocationData; // ✅ Now optional (fixes the TS2322 error)
+}
+
+export interface LocationData {
+  lat: number;
+  lon: number;
+  type: 'gps' | 'text';
+  address_text?: string;
 }
 
 export interface IngestResponse {
@@ -69,4 +69,20 @@ export interface GrievanceCase {
       officialEmail: string;
     };
   };
+}
+
+export interface DispatchRecord {
+  email: string;
+  status: string;
+  official_name?: string;
+}
+
+export interface StatusResponse {
+  status: 'chatting' | 'found' | 'processing';
+  current_state: GrievanceStatus | 'PENDING_DETAILS';
+  reply_message?: string;      // ✅ Perfectly matches FastAPI's new gatekeeper output
+  issue_category?: string;
+  description_text?: string;
+  system_metadata?: any;
+  dispatch_records?: DispatchRecord[];
 }
