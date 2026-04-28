@@ -138,16 +138,25 @@ def _build_mime_message(subject, body_text, body_html, from_email, to_email, tra
 
 async def _send_smtp_async(msg_bytes: bytes, to_email: str) -> Tuple[int, str]:
     try:
+        # Gmail on 587 needs STARTTLS, not implicit TLS
         smtp = aiosmtplib.SMTP(
-            hostname=settings.SMTP_HOST, port=settings.SMTP_PORT,
-            use_tls=settings.SMTP_USE_TLS, timeout=15, validate_certs=True
+            hostname=settings.SMTP_HOST,
+            port=settings.SMTP_PORT,
+            start_tls=True if settings.SMTP_PORT == 587 else False,
+            use_tls=True if settings.SMTP_PORT == 465 else False,
+            timeout=15,
+            validate_certs=True
         )
         await smtp.connect()
         await smtp.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
-        await smtp.sendmail(settings.DISPATCH_FROM_EMAIL, [to_email], msg_bytes)
+
+        # Envelope-from MUST be bare email (already fixed if you applied the parseaddr fix)
+        from email.utils import parseaddr
+        envelope_from = parseaddr(settings.DISPATCH_FROM_EMAIL)[1]
+        await smtp.sendmail(envelope_from, [to_email], msg_bytes)
         await smtp.quit()
         return 250, "OK"
-        
+
     except aiosmtplib.SMTPConnectError as e:
         return 421, f"Connection failed: {e}"
     except aiosmtplib.SMTPAuthenticationError as e:

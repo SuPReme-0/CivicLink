@@ -73,15 +73,13 @@ async def _fetch_legal_citations(
     issue_category: str,
     severity: str
 ) -> List[Dict[str, str]]:
-    
-    # 🚨 FIX: Graceful degradation. If DB drops, we still generate the draft without citations.
     try:
         if not prisma.is_connected():
             await prisma.connect()
-            
-        citations = await prisma.legalcitation.find_many(
+        
+        # Get all citations that could be relevant by state or nationwide
+        all_citations = await prisma.legalcitation.find_many(
             where={
-                "issueCategory": {"contains": issue_category},
                 "OR": [
                     {"state": jurisdiction.get("state")},
                     {"district": jurisdiction.get("district")},
@@ -89,21 +87,28 @@ async def _fetch_legal_citations(
                 ]
             },
             order={"relevanceScore": "desc"},
-            take=5
+            take=30   # fetch a larger set and filter in Python
         )
         
-        return [{
-            "act_name": c.actName,
-            "section": c.section,
-            "description": c.description,
-            "penalty": c.penalty,
-            "authority": c.enforcingAuthority
-        } for c in citations]
-        
+        # Filter case‑insensitively for the issue category
+        target = issue_category.lower()
+        matched = []
+        for c in all_citations:
+            cat = (c.issueCategory or "").lower()
+            # Check if any part of the jurisdiction's issueCategory appears in the citation's category
+            if any(word in cat for word in target.split(",")):
+                matched.append({
+                    "act_name": c.actName,
+                    "section": c.section,
+                    "description": c.description,
+                    "penalty": c.penalty,
+                    "authority": c.enforcingAuthority
+                })
+        return matched[:5]
     except Exception as e:
         logger.warning(f"Legal citation DB unreachable, proceeding with general rights: {e}")
         return []
-
+    
 # ---------------------------------------------------------
 # 3. STRICT OUTPUT SCHEMA
 # ---------------------------------------------------------
@@ -126,48 +131,47 @@ def _build_drafting_prompt(
     citizen_text: str, jurisdiction: Dict[str, str], contact: Dict[str, Any],
     severity: str, citations: List[Dict[str, str]], original_lang: str
 ) -> str:
-    citation_text = "\n".join([
-        f"- {c['act_name']}, Section {c['section']}: {c['description']}"
-        for c in citations
-    ]) or "No specific citations found; reference general citizen grievance rights."
-    
+    # Prepare a human‑readable list of citations
+    if citations:
+        citations_block = "\n".join(
+            f"- {c['act_name']}, Section {c['section']}: {c['description']} (Penalty: {c.get('penalty','')})"
+            for c in citations
+        )
+    else:
+        citations_block = "No specific local statutes were found, but the general obligation of municipal bodies to maintain public infrastructure applies."
+
     urgency_map = {
-        "CRITICAL": "IMMEDIATE ACTION REQUIRED within 24 hours",
-        "HIGH": "urgent attention within 48 hours", 
-        "MEDIUM": "timely resolution within 7 days",
-        "LOW": "resolution at earliest convenience"
+        "CRITICAL": "within 24 hours",
+        "HIGH": "within 48 hours",
+        "MEDIUM": "within 7 days",
+        "LOW": "at the earliest convenience"
     }
-    urgency = urgency_map.get(severity, urgency_map["MEDIUM"])
-    
+    timeline = urgency_map.get(severity, "within 7 days")
+
     return f"""
-You are a legal drafting assistant for CivicLink, a citizen grievance resolution system.
-Draft a FORMAL government complaint email based on the following inputs.
+You are an expert legal drafting assistant for CivicLink, a citizen grievance platform. 
+Write a FORMAL GOVERNMENT COMPLAINT LETTER in the voice of a concerned Indian citizen.
 
-=== INPUTS ===
-Citizen's Original Message ({original_lang}):
-"{citizen_text}"
+The letter must sound genuinely human—respectful, urgent, and personal—while being grammatically perfect and suitable for an official submission.
 
-Jurisdiction:
-- Ward: {jurisdiction.get('ward', 'N/A')}
-- Municipality: {jurisdiction.get('municipality', 'N/A')}
-- District: {jurisdiction.get('district')}
+=== INPUT DETAILS ===
+Citizen's description: "{citizen_text}"
+Location: {jurisdiction.get('ward', 'Unknown Ward')}, {jurisdiction.get('municipality', '')}, {jurisdiction.get('district', 'Unknown District')}, {jurisdiction.get('state', '')}
+Issue severity: {severity} — requires action {timeline}
+Target official: {contact.get('officialDesignation', 'Concerned Authority')}
 
-Target Official:
-- Designation: {contact.get('officialDesignation', 'Concerned Authority')}
+Relevant legal provisions (IMPORTANT – reference these naturally in the letter):
+{citations_block}
 
-Severity: {severity} ({urgency})
-
-Relevant Legal Citations:
-{citation_text}
-
-=== OUTPUT REQUIREMENTS ===
-1. Translate any non-English content to formal, professional English.
-2. Use respectful but firm bureaucratic language appropriate for Indian government correspondence.
-3. Structure the email with clear sections. Include ALL provided legal citations.
-4. Request a specific timeline for acknowledgment ({urgency}).
-5. 🚨 PII REDACTION: You MUST strictly scrub sensitive personal identifiers from the citizen's text. 
-    Replace any Aadhaar Numbers with "[Aadhaar Redacted]", RRNs (Resident Registration Numbers) with "[RRN Omitted]", MyNumber (Japanese Individual Number) with "[MyNumber Redacted]", and any Phone Numbers, PAN cards, or personal names with "[REDACTED]".
-6. Output STRICTLY in valid JSON matching this schema:
+=== WRITING GUIDELINES ===
+1. Start with a polite salutation addressing the official by their core title only (e.g., “Respected Chief Engineer”).
+2. In the first paragraph, describe the situation as a resident who witnessed a dangerous incident (e.g., a bus tyre stuck in a huge pothole). Use concrete details from the citizen’s description.
+3. Explain why this is a risk to public safety and the community.
+4. Weave the legal citations into the letter naturally—do not just list them. For example: “Under the West Bengal Municipal Act, 1993, Section 63, your department is obligated to maintain public roads.”
+5. Request a specific resolution timeline ({timeline}) and politely ask for an acknowledgement.
+6. End with a sincere closing that expresses hope and thanks.
+7. The letter must be structured but not robotic. Use full paragraphs, not bullet points.
+8. Output ONLY valid JSON matching this schema:
 {json.dumps(DraftedEmailSchema.model_json_schema(), indent=2)}
 """
 
