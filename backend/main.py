@@ -161,8 +161,7 @@ origins = settings.CORS_ORIGINS.split(",") if settings.CORS_ORIGINS else []
 if not origins or "*" in origins:
     logger.warning("CORS_ORIGINS is empty or contains wildcard. Defaulting to strict localhost/Vercel.")
     origins = [
-        "http://localhost:3000",
-        "https://civic-link.vercel.app" 
+        "https://civic-link-eta.vercel.app" 
     ]
 
 app.add_middleware(
