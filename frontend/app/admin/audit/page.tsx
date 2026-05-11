@@ -10,21 +10,8 @@ import {
 import { toast } from 'react-hot-toast';
 
 import { cn, formatRelativeTime } from '@/lib/utils';
+import { apiClient } from '@/lib/api-client';
 import type { AuditLog, AuditSeverity, AuditAction } from '@/types';
-
-// =============================================================================
-// 🚨 SECURE ADMIN API WRAPPERS (Vercel Ready)
-// =============================================================================
-const secureAdminFetch = async (endpoint: string) => {
-  const res = await fetch(`/api/v1/admin/${endpoint}`, {
-    headers: { 
-      'Authorization': `Bearer ${process.env.NEXT_PUBLIC_FRONTEND_API_KEY || 'civiclink_dev_super_secret_998877'}` 
-    },
-    cache: 'no-store'
-  });
-  if (!res.ok) throw new Error(`Fetch failed: ${res.statusText}`);
-  return res.json();
-};
 
 // =============================================================================
 // UI COMPONENTS (Amethyst & Crimson)
@@ -157,7 +144,7 @@ export default function AuditPage() {
   // 🚨 FIXED: Now queries the real database via secureAdminFetch
   const { data: logs = [], isLoading, refetch, isFetching } = useQuery({
     queryKey: ['admin', 'audit'],
-    queryFn: () => secureAdminFetch('audit'),
+    queryFn: () => apiClient.fetchAuditLogs(),
     refetchInterval: isLive ? 5000 : false,
   });
 

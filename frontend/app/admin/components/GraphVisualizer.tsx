@@ -12,35 +12,7 @@ import { toast } from 'react-hot-toast';
 
 import { cn, formatRelativeTime } from '@/lib/utils';
 import { useRealTime } from '../layout';
-
-// =============================================================================
-// 🚨 SECURE ADMIN API WRAPPERS (Vercel Ready)
-// =============================================================================
-const getBaseUrl = () => {
-  const url = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
-  return url.replace('localhost', '127.0.0.1'); 
-};
-
-const secureAdminFetch = async (endpoint: string) => {
-  const res = await fetch(`${getBaseUrl()}/api/v1/admin/${endpoint}`, {
-    headers: { 'Authorization': `Bearer ${process.env.NEXT_PUBLIC_FRONTEND_API_KEY || 'civiclink_dev_super_secret_998877'}` },
-    cache: 'no-store'
-  });
-  if (!res.ok) throw new Error(`Fetch failed: ${res.statusText}`);
-  return res.json();
-};
-
-const secureAdminAction = async (endpoint: string, method: string = 'POST') => {
-  const res = await fetch(`${getBaseUrl()}/api/v1/admin/${endpoint}`, {
-    method,
-    headers: { 
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${process.env.NEXT_PUBLIC_FRONTEND_API_KEY || 'civiclink_dev_super_secret_998877'}` 
-    }
-  });
-  if (!res.ok) throw new Error(`Action failed: ${res.statusText}`);
-  return res.json();
-};
+import { apiClient } from '@/lib/api-client';
 
 // =============================================================================
 // TYPES
@@ -244,7 +216,7 @@ export function GraphVisualizer({
   // 🚨 FIXED: Now hits the real LangGraph state via secureAdminFetch
   const { data: graphState, isLoading, refetch } = useQuery({
     queryKey: ['admin', 'graph', threadId],
-    queryFn: () => secureAdminFetch(`graph-state/${threadId}`),
+    queryFn: () => apiClient.fetchGraphState(threadId),
     enabled: !!threadId && !isPreview,
     refetchInterval: 3000 // Fast polling to watch AI process in real-time
   });
@@ -279,7 +251,7 @@ export function GraphVisualizer({
   // 🚨 FIXED: Now hits the secure retry endpoint
   const handleRetry = async (node: GraphNode) => {
     try {
-      await secureAdminAction(`retry/${threadId}/${node.id}`);
+      await apiClient.retryGraphNode(threadId, node.id);
       toast.success(`Directive accepted. Retrying ${node.name}.`);
       refetch();
     } catch (error) {

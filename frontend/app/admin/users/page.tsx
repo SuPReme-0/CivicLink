@@ -12,40 +12,8 @@ import {
 import { toast } from 'react-hot-toast';
 
 import { cn, formatRelativeTime } from '@/lib/utils';
+import { apiClient } from '@/lib/api-client';
 import type { AdminUser, UserRole, UserStatus } from '@/types';
-
-// =============================================================================
-// 🚨 SECURE ADMIN API WRAPPERS (Vercel Ready)
-// =============================================================================
-const getBaseUrl = () => {
-  const url = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
-  return url.replace('localhost', '127.0.0.1'); 
-};
-
-const secureAdminFetch = async (endpoint: string) => {
-  const res = await fetch(`${getBaseUrl()}/api/v1/admin/${endpoint}`, {
-    headers: { 'Authorization': `Bearer ${process.env.NEXT_PUBLIC_FRONTEND_API_KEY || 'civiclink_dev_super_secret_998877'}` },
-    cache: 'no-store'
-  });
-  if (!res.ok) throw new Error(`Fetch failed: ${res.statusText}`);
-  return res.json();
-};
-
-const secureAdminMutation = async (endpoint: string, data: any, method: string = 'POST') => {
-  const res = await fetch(`${getBaseUrl()}/api/v1/admin/${endpoint}`, {
-    method,
-    headers: { 
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${process.env.NEXT_PUBLIC_FRONTEND_API_KEY || 'civiclink_dev_super_secret_998877'}` 
-    },
-    body: JSON.stringify(data)
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || `Action failed: ${res.statusText}`);
-  }
-  return res.json();
-};
 
 // =============================================================================
 // UI COMPONENTS (Amethyst & Crimson)
@@ -216,14 +184,14 @@ export default function IdentityManagementPage() {
   // --- QUERIES ---
   const { data: admins = [], isLoading: isLoadingAdmins } = useQuery({
     queryKey: ['admin', 'users'],
-    queryFn: () => secureAdminFetch('users'),
+    queryFn: () => apiClient.fetchUsers(),
     enabled: activeTab === 'personnel',
     refetchInterval: 60000,
   });
 
   const { data: citizens = [], isLoading: isLoadingCitizens } = useQuery({
     queryKey: ['admin', 'citizens'],
-    queryFn: () => secureAdminFetch('citizens'),
+    queryFn: () => apiClient.fetchCitizens(),
     enabled: activeTab === 'citizens',
     refetchInterval: 30000,
   });
@@ -232,7 +200,7 @@ export default function IdentityManagementPage() {
 
   // --- MUTATIONS ---
   const handleCreateUser = useMutation({
-    mutationFn: (data: any) => secureAdminMutation('users', data),
+    mutationFn: (data: any) => apiClient.createUser(data),
     onSuccess: () => {
       toast.success('Personnel ledger updated', { style: { background: '#0a040d', color: '#10b981', border: '1px solid rgba(16,185,129,0.3)' } });
       queryClient.invalidateQueries({ queryKey: ['admin', 'users'] });

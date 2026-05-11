@@ -9,31 +9,7 @@ import {
 } from 'lucide-react';
 import { toast } from 'react-hot-toast';
 import { cn } from '@/lib/utils';
-
-// =============================================================================
-// 🚨 SECURE ADMIN API WRAPPERS (Vercel Ready)
-// =============================================================================
-const secureAdminFetch = async (endpoint: string) => {
-  const res = await fetch(`/api/v1/admin/${endpoint}`, {
-    headers: { 'Authorization': `Bearer ${process.env.NEXT_PUBLIC_FRONTEND_API_KEY || 'civiclink_dev_super_secret_998877'}` },
-    cache: 'no-store'
-  });
-  if (!res.ok) throw new Error(`Fetch failed: ${res.statusText}`);
-  return res.json();
-};
-
-const secureAdminMutation = async (endpoint: string, data: any) => {
-  const res = await fetch(`/api/v1/admin/${endpoint}`, {
-    method: 'PUT', // Backend expects a PUT for settings updates
-    headers: { 
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${process.env.NEXT_PUBLIC_FRONTEND_API_KEY || 'civiclink_dev_super_secret_998877'}` 
-    },
-    body: JSON.stringify(data)
-  });
-  if (!res.ok) throw new Error(`Update failed: ${res.statusText}`);
-  return res.json();
-};
+import { apiClient } from '@/lib/api-client';
 
 // =============================================================================
 // TYPES
@@ -156,7 +132,7 @@ export default function SettingsPage() {
   // 🚨 FIXED: Now queries the real database!
   const { data: savedSettings, isLoading } = useQuery({
     queryKey: ['admin', 'settings'],
-    queryFn: () => secureAdminFetch('settings'),
+    queryFn: () => apiClient.fetchSystemSettings(),
   });
 
   useEffect(() => {
@@ -168,7 +144,7 @@ export default function SettingsPage() {
 
   // 🚨 FIXED: Now explicitly mutates the DB via PUT request
   const saveMutation = useMutation({
-    mutationFn: (data: SystemSettings) => secureAdminMutation('settings', data),
+    mutationFn: (data: SystemSettings) => apiClient.updateSystemSettings(data),
     onSuccess: () => {
       toast.success('Configuration Synchronized', { style: { background: '#0a040d', color: '#10b981', border: '1px solid rgba(16,185,129,0.3)' } });
       setIsDirty(false);

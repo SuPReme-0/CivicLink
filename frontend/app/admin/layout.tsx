@@ -10,27 +10,16 @@ import {
 import toast, { Toaster } from 'react-hot-toast';
 
 import { cn } from '@/lib/utils';
-
-// =============================================================================
-// 🚨 SECURE ADMIN API WRAPPERS (Vercel Ready)
-// =============================================================================
-const getBaseUrl = () => {
-  const url = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
-  return url.replace('localhost', '127.0.0.1'); 
-};
-
-const secureAdminPing = async () => {
-  const res = await fetch(`${getBaseUrl()}/api/v1/admin/dashboard-stats`, {
-    headers: { 'Authorization': `Bearer ${process.env.NEXT_PUBLIC_FRONTEND_API_KEY || 'civiclink_dev_super_secret_998877'}` },
-    cache: 'no-store'
-  });
-  if (!res.ok) throw new Error(`Ping failed`);
-  return res.json();
-};
+import { apiClient } from '@/lib/api-client';
 
 // =============================================================================
 // REAL-TIME CONTEXT (SSE + Fallback Polling)
 // =============================================================================
+
+// Local helper for EventSource URL (which runs client-side only)
+const getBaseUrlForSSE = () => {
+  return process.env.NEXT_PUBLIC_API_URL || 'https://priyanshu0-1-civiclink.hf.space';
+};
 
 type RealTimeContextType = {
   isConnected: boolean;
@@ -53,7 +42,7 @@ export function RealTimeProvider({ children }: { children: React.ReactNode }) {
     const connectSSE = () => {
       try {
         // 🚨 FIXED: Correct backend SSE route
-        eventSource = new EventSource(`${getBaseUrl()}/api/v1/admin/stream`);
+        eventSource = new EventSource(`${getBaseUrlForSSE()}/api/v1/admin/stream`);
         
         eventSource.onopen = () => {
           setIsConnected(true);
@@ -89,7 +78,7 @@ export function RealTimeProvider({ children }: { children: React.ReactNode }) {
       pollIntervalRef.current = setInterval(async () => {
         try {
           // 🚨 FIXED: Now uses the Secure Admin Ping to bypass auth blocks
-          await secureAdminPing(); 
+          await apiClient.checkHealth(); 
           setLastUpdate(new Date());
           setIsConnected(true);
         } catch (e) {

@@ -14,7 +14,17 @@ import { toast } from 'react-hot-toast';
 import { cn, formatRelativeTime } from '@/lib/utils';
 import { useRealTime } from '../layout';
 import { StatusBadge } from '../components/StatusBadge';
+import { apiClient } from '@/lib/api-client';
 import type { GrievanceCase, GrievanceStatus } from '@/types';
+
+// =============================================================================
+// TYPES
+// =============================================================================
+interface FilterState {
+  status?: GrievanceStatus | '';
+  severity?: string;
+  dateRange?: string;
+}
 
 // =============================================================================
 // UTILITIES: DEBOUNCE HOOK (Prevents API spam on Search)
@@ -26,59 +36,6 @@ function useDebounce<T>(value: T, delay: number): T {
     return () => clearTimeout(handler);
   }, [value, delay]);
   return debouncedValue;
-}
-
-// =============================================================================
-// 🚨 SECURE ADMIN API WRAPPERS (Vercel Ready)
-// =============================================================================
-const getBaseUrl = () => {
-  const url = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
-  return url.replace('localhost', '127.0.0.1'); 
-};
-
-// 🚨 BUG 1 FIXED: Restored proper dual-authentication headers!
-const getAuthHeaders = () => {
-  const defaultKey = process.env.NEXT_PUBLIC_FRONTEND_API_KEY || 'civiclink_dev_super_secret_998877';
-  let token = defaultKey;
-  
-  if (typeof window !== 'undefined') {
-    const localToken = localStorage.getItem('civiclink_admin_token');
-    if (localToken) token = localToken;
-  }
-
-  return {
-    'Authorization': `Bearer ${token}`,
-    'X-Frontend-API-Key': defaultKey,
-    'Content-Type': 'application/json'
-  };
-};
-
-const secureAdminFetch = async (endpoint: string) => {
-  const res = await fetch(`${getBaseUrl()}/api/v1/admin/${endpoint}`, {
-    headers: getAuthHeaders(),
-    cache: 'no-store'
-  });
-  if (!res.ok) throw new Error(`Fetch failed: ${res.statusText}`);
-  return res.json();
-};
-
-const secureAdminAction = async (threadId: string, decision: 'APPROVED' | 'REJECTED') => {
-  const res = await fetch(`${getBaseUrl()}/api/v1/admin/review/${threadId}`, {
-    method: 'POST',
-    headers: getAuthHeaders(),
-    body: JSON.stringify({ decision, notes: "Processed via Admin Ledger Bulk/Quick Action" })
-  });
-  if (!res.ok) throw new Error(`Action failed: ${res.statusText}`);
-  return res.json();
-};
-
-// =============================================================================
-// TYPES
-// =============================================================================
-interface FilterState {
-  status?: GrievanceStatus | '';
-  severity?: string;
-  dateRange?: string;
 }
 
 // =============================================================================
@@ -509,7 +466,7 @@ export default function GrievancesPage() {
       if (debouncedSearchQuery) q.append('search', debouncedSearchQuery);
       if (filters.status) q.append('status', filters.status);
       if (filters.severity) q.append('severity', filters.severity);
-      return secureAdminFetch(`grievances?${q.toString()}`);
+      return apiClient.fetchGrievances(Object.fromEntries(q.entries()));
     },
     refetchInterval: 15000,
   });
@@ -568,7 +525,7 @@ export default function GrievancesPage() {
     
     try {
       await Promise.all(
-        Array.from(selectedIds).map(threadId => secureAdminAction(threadId, action))
+        Array.from(selectedIds).map(threadId => apiClient.reviewGrievance(threadId, action))
       );
       
       toast.success(action === 'APPROVED' ? `Authorized ${selectedIds.size} payload(s)` : `Halted ${selectedIds.size} payload(s)`, {
@@ -584,7 +541,7 @@ export default function GrievancesPage() {
   
   const handleQuickAction = useCallback(async (action: 'APPROVED' | 'REJECTED', grievance: GrievanceCase) => {
     try {
-      await secureAdminAction(grievance.threadId, action);
+      await apiClient.reviewGrievance(grievance.threadId, action);
       toast.success(action === 'APPROVED' ? 'Directive Authorized' : 'Directive Halted', {
         style: { background: '#0a040d', color: action === 'APPROVED' ? '#10b981' : '#f43f5e', border: `1px solid ${action === 'APPROVED' ? 'rgba(16,185,129,0.3)' : 'rgba(244,63,94,0.3)'}` }
       });

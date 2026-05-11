@@ -15,37 +15,8 @@ import { useRealTime } from '../../layout';
 import { GraphVisualizer } from '../../components/GraphVisualizer';
 import { HITLPanel } from '../../components/HITLPanel';
 import { StatusBadge } from '../../components/StatusBadge';
+import { apiClient } from '@/lib/api-client';
 import type { GrievanceCase } from '@/types';
-
-// =============================================================================
-// 🚨 SECURE ADMIN API WRAPPERS (Vercel Ready)
-// =============================================================================
-const getBaseUrl = () => {
-  const url = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
-  return url.replace('localhost', '127.0.0.1'); 
-};
-
-const secureAdminFetch = async (endpoint: string) => {
-  const res = await fetch(`${getBaseUrl()}/api/v1/admin/${endpoint}`, {
-    headers: { 'Authorization': `Bearer ${process.env.NEXT_PUBLIC_FRONTEND_API_KEY || 'civiclink_dev_super_secret_998877'}` },
-    cache: 'no-store'
-  });
-  if (!res.ok) throw new Error(`Fetch failed: ${res.statusText}`);
-  return res.json();
-};
-
-const secureAdminAction = async (threadId: string, decision: 'APPROVED' | 'REJECTED', notes?: string) => {
-  const res = await fetch(`${getBaseUrl()}/api/v1/admin/review/${threadId}`, {
-    method: 'POST',
-    headers: { 
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${process.env.NEXT_PUBLIC_FRONTEND_API_KEY || 'civiclink_dev_super_secret_998877'}` 
-    },
-    body: JSON.stringify({ decision, notes: notes || "Processed via Admin Node Inspector" })
-  });
-  if (!res.ok) throw new Error(`Action failed: ${res.statusText}`);
-  return res.json();
-};
 
 // =============================================================================
 // CASE HEADER COMPONENT
@@ -242,7 +213,7 @@ function MessageHistory({ grievance }: { grievance: GrievanceCase }) {
     // 🚨 Extracting conversation from graph-state if a dedicated messages route doesn't exist yet
     queryFn: async () => {
       try {
-        const state = await secureAdminFetch(`graph-state/${grievance.threadId}`);
+        const state = await apiClient.fetchGraphState(grievance.threadId);
         // This simulates message extraction. Adjust depending on your backend LangGraph return object.
         return state?.messages || []; 
       } catch (e) {
@@ -328,7 +299,7 @@ export default function CaseReviewPage() {
     queryKey: ['admin', 'case', threadId],
     // 🚨 Extracting the exact case dynamically using the grievances endpoint search
     queryFn: async () => {
-      const res = await secureAdminFetch(`grievances?search=${threadId}`);
+      const res = await apiClient.fetchGrievances({ search: threadId });
       return res.items?.[0] || null;
     },
     enabled: !!threadId,
@@ -349,7 +320,7 @@ export default function CaseReviewPage() {
   }, [threadId, subscribe, refetch]);
   
   const approveMutation = useMutation({
-    mutationFn: () => secureAdminAction(threadId, 'APPROVED'),
+    mutationFn: () => apiClient.reviewGrievance(threadId, 'APPROVED'),
     onSuccess: () => {
       toast.success('Directive Approved: Dispatching via DKIM');
       queryClient.invalidateQueries({ queryKey: ['admin', 'case', threadId] });
@@ -358,7 +329,7 @@ export default function CaseReviewPage() {
   });
   
   const rejectMutation = useMutation({
-    mutationFn: (reason: string) => secureAdminAction(threadId, 'REJECTED', reason),
+    mutationFn: (reason: string) => apiClient.reviewGrievance(threadId, 'REJECTED', reason),
     onSuccess: () => {
       toast.success('Thread Terminated');
       queryClient.invalidateQueries({ queryKey: ['admin', 'case', threadId] });

@@ -297,27 +297,10 @@ function DashboardContent() {
     }
   }, [chatState]);
 
-  // 🚨 FIXED: Corrected endpoint path to '/me/grievances'
+  // 🚨 FIXED: Now uses centralized apiClient which auto-injects session headers
   const { data: historyData, refetch: refetchHistory } = useQuery({
     queryKey: ['citizen-grievances'],
-    queryFn: async () => {
-      let sessionId = '';
-      if (typeof window !== 'undefined') {
-        try {
-          const data = localStorage.getItem(USER_STORAGE_KEY);
-          if (data) sessionId = JSON.parse(data).sessionId;
-        } catch (e) {}
-      }
-
-      const res = await fetch('/api/v1/auth/citizen/me/grievances', {
-        headers: { 
-          'X-Frontend-API-Key': process.env.NEXT_PUBLIC_FRONTEND_API_KEY || 'civiclink_dev_super_secret_998877',
-          'X-Session-ID': sessionId
-        }
-      });
-      if (!res.ok) throw new Error('History fetch failed');
-      return res.json();
-    }
+    queryFn: () => apiClient.fetchMyGrievances()
   });
 
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [chatState.messages, chatState.isTyping]);

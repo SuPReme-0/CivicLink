@@ -17,42 +17,11 @@ import {
 import toast from 'react-hot-toast';
 
 import { cn } from '@/lib/utils';
+import { apiClient } from '@/lib/api-client';
 import { useRealTime } from './layout';
 import { MetricCard } from './components/MetricCard';
 import { StatusBadge } from './components/StatusBadge';
 import { GraphVisualizer } from './components/GraphVisualizer';
-
-// =============================================================================
-// 🚨 SECURE FETCH WRAPPERS (Vercel Ready)
-// =============================================================================
-const getBaseUrl = () => {
-  const url = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
-  return url.replace('localhost', '127.0.0.1'); 
-};
-
-const secureAdminFetch = async (endpoint: string) => {
-  const res = await fetch(`${getBaseUrl()}/api/v1/admin/${endpoint}`, {
-    headers: {
-      'X-Frontend-API-Key': process.env.NEXT_PUBLIC_FRONTEND_API_KEY || 'civiclink_dev_super_secret_998877',
-      'Authorization': `Bearer ${process.env.NEXT_PUBLIC_FRONTEND_API_KEY || 'civiclink_dev_super_secret_998877'}`
-    },
-    cache: 'no-store'
-  });
-  if (!res.ok) throw new Error(`Fetch failed: ${res.statusText}`);
-  return res.json();
-};
-
-const secureAdminAction = async (endpoint: string, method: string = 'POST') => {
-  const res = await fetch(`${getBaseUrl()}/api/v1/admin/${endpoint}`, {
-    method,
-    headers: {
-      'X-Frontend-API-Key': process.env.NEXT_PUBLIC_FRONTEND_API_KEY || 'civiclink_dev_super_secret_998877',
-      'Authorization': `Bearer ${process.env.NEXT_PUBLIC_FRONTEND_API_KEY || 'civiclink_dev_super_secret_998877'}`
-    }
-  });
-  if (!res.ok) throw new Error(`Action failed: ${res.statusText}`);
-  return res.json();
-};
 
 // =============================================================================
 // OPTICAL CHARTS 
@@ -139,7 +108,7 @@ function StatusPieChart({ data }: { data: any[] }) {
 function RecentGrievances({ selectedId, onSelect }: { selectedId: string | null, onSelect: (id: string) => void }) {
   const { data, isLoading, refetch, isFetching } = useQuery({
     queryKey: ['admin', 'grievances', 'dashboard'],
-    queryFn: () => secureAdminFetch('grievances?pageSize=6'), 
+    queryFn: () => apiClient.fetchGrievances({ pageSize: 6 }), 
     refetchInterval: 15000
   });
   
@@ -214,16 +183,12 @@ function RecentGrievances({ selectedId, onSelect }: { selectedId: string | null,
 function SystemHealth() {
   const { data: health, isLoading } = useQuery({
     queryKey: ['admin', 'system-health'],
-    queryFn: async () => {
-      const res = await fetch(`${getBaseUrl()}/ready`);
-      if (!res.ok) throw new Error('Healthcheck failed');
-      return res.json();
-    },
+    queryFn: () => apiClient.checkHealth(),
     refetchInterval: 30000,
   });
 
-  const isHealthy = health?.status === "healthy";
-  const checks = health?.checks || {};
+  const isHealthy = (health as any)?.status === "healthy";
+  const checks = (health as any)?.checks || {};
 
   const services = [
     { name: 'API Gateway', status: isHealthy ? 'operational' : 'degraded', icon: Globe },
@@ -266,7 +231,7 @@ function SystemHealth() {
 function PendingReviews() {
   const { data, isLoading } = useQuery({ 
     queryKey: ['admin', 'pending-reviews'], 
-    queryFn: () => secureAdminFetch('grievances?status=AWAITING_REVIEW&pageSize=5'), 
+    queryFn: () => apiClient.fetchGrievances({ status: 'AWAITING_REVIEW', pageSize: 5 }), 
     refetchInterval: 10000 
   });
   
@@ -275,7 +240,7 @@ function PendingReviews() {
 
   const handleAction = async (threadId: string, action: 'APPROVED' | 'REJECTED') => {
     try {
-      await secureAdminAction(`review/${threadId}`, 'POST');
+      await apiClient.reviewGrievance(threadId, 'APPROVED');
       toast.success(`Directive ${action} accepted.`);
       queryClient.invalidateQueries({ queryKey: ['admin', 'pending-reviews'] });
     } catch (e) { 
@@ -336,7 +301,7 @@ export default function AdminDashboard() {
 
   const { data: stats, isLoading: statsLoading, refetch: refetchStats, isFetching } = useQuery({
     queryKey: ['admin', 'dashboard-stats'],
-    queryFn: () => secureAdminFetch('dashboard-stats'),
+    queryFn: () => apiClient.fetchDashboardStats(),
     refetchInterval: 15000,
   });
 

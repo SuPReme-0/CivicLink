@@ -27,16 +27,15 @@ export class ApiError extends Error {
 // API CLIENT
 // ============================================================================
 class ApiClient {
-  private defaultTimeout = 30000; // 30 seconds
+  // 🚨 UPGRADED: 60 seconds to allow the 70B model to scrape and process
+  private defaultTimeout = 60000; 
 
   /**
-   * Resolves the base URL dynamically to support both Client-Side (CSR) 
-   * and Server-Side (SSR) rendering in Next.js.
+   * 🚨 UPGRADED: Direct-to-Cloud Base URL.
+   * Bypasses Vercel's relative paths to prevent 504 Timeouts.
    */
   private getBaseUrl(): string {
-    if (typeof window !== 'undefined') return ''; // Browser uses relative path
-    if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}`;
-    return process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000';
+    return process.env.NEXT_PUBLIC_API_URL || 'https://priyanshu0-1-civiclink.hf.space';
   }
 
   /**
@@ -49,9 +48,9 @@ class ApiClient {
       headers.set('Content-Type', 'application/json');
     }
 
-    if (process.env.NEXT_PUBLIC_FRONTEND_API_KEY) {
-      headers.set('X-Frontend-API-Key', process.env.NEXT_PUBLIC_FRONTEND_API_KEY);
-    }
+    // 🚨 UPGRADED: The Universal Key
+    const frontendKey = process.env.NEXT_PUBLIC_FRONTEND_API_KEY || 'civiclink_dev_super_secret_998877';
+    headers.set('X-Frontend-API-Key', frontendKey);
 
     if (typeof window !== 'undefined') {
       try {
@@ -61,13 +60,16 @@ class ApiClient {
           if (parsed.sessionId) headers.set('X-Session-ID', parsed.sessionId);
         }
 
-        const adminToken = localStorage.getItem('civiclink_admin_token');
-        if (adminToken) {
-          headers.set('Authorization', `Bearer ${adminToken}`);
-        }
+        // Try to get admin token, fallback to the Universal Key if it doesn't exist
+        const adminToken = localStorage.getItem('civiclink_admin_token') || frontendKey;
+        headers.set('Authorization', `Bearer ${adminToken}`);
+        
       } catch (e) {
         console.error('Session parsing error:', e);
       }
+    } else {
+      // Server-Side Rendering (SSR) fallback
+      headers.set('Authorization', `Bearer ${frontendKey}`);
     }
 
     return headers;
@@ -118,7 +120,7 @@ class ApiClient {
         if (response.status === 401 && typeof window !== 'undefined') {
           if (endpoint.startsWith('/v1/admin')) {
              localStorage.removeItem('civiclink_admin_token');
-             window.location.href = '/';
+             window.location.href = '/'; // Modify if your login route is different
           }
         }
 
@@ -129,7 +131,7 @@ class ApiClient {
     } catch (error: any) {
       clearTimeout(timeoutId);
       if (error.name === 'AbortError') {
-        throw new ApiError(408, 'Network request timed out. Please check your connection.');
+        throw new ApiError(408, 'Network request timed out. The AI might be processing a heavy task.');
       }
       throw error;
     }
@@ -146,6 +148,10 @@ class ApiClient {
     });
   }
 
+  async fetchMyGrievances() {
+    return this.request<any>('/v1/auth/citizen/me/grievances', { method: 'GET' });
+  }
+
   async getStatus(threadId: string): Promise<StatusResponse> {
     return this.request<StatusResponse>(`/v1/status/${threadId}`, { method: 'GET' });
   }
@@ -155,7 +161,7 @@ class ApiClient {
       method: 'POST',
       body: JSON.stringify({ 
         username: username, 
-        password: passwordHash // 🚨 REVERTED: FastAPI expects 'password' here!
+        password: passwordHash 
       }),
     });
   }
@@ -165,8 +171,8 @@ class ApiClient {
       method: 'POST',
       body: JSON.stringify({ 
         username: username, 
-        password: passwordHash, // 🚨 REVERTED: FastAPI expects 'password' here!
-        phone_number: phone     // Keep this as phone_number
+        password: passwordHash, 
+        phone_number: phone     
       }),
     });
   }
@@ -176,7 +182,7 @@ class ApiClient {
   // ==========================================
 
   async fetchDashboardStats() {
-    return this.request<any>('/v1/admin/stats', { method: 'GET' });
+    return this.request<any>('/v1/admin/dashboard-stats', { method: 'GET' }); // Fixed endpoint name
   }
 
   async fetchReviewQueue() {
@@ -196,6 +202,40 @@ class ApiClient {
       method: 'POST',
       body: JSON.stringify({ human_review_decision: "APPROVED" }) 
     });
+  }
+
+  // ==========================================
+  // UNIFIED ADMIN & HEALTH METHODS
+  // ==========================================
+
+  /** Replaces `secureAdminFetch` */
+  async adminGet<T = any>(endpoint: string) {
+    // Strips leading slash if you accidentally pass it (e.g., '/users' becomes 'users')
+    const cleanEndpoint = endpoint.startsWith('/') ? endpoint.slice(1) : endpoint;
+    return this.request<T>(`/v1/admin/${cleanEndpoint}`, { method: 'GET' });
+  }
+
+  /** Replaces `secureAdminMutation` and generic `secureAdminAction` */
+  async adminMutation<T = any>(endpoint: string, data?: any, method: string = 'POST') {
+    const cleanEndpoint = endpoint.startsWith('/') ? endpoint.slice(1) : endpoint;
+    return this.request<T>(`/v1/admin/${cleanEndpoint}`, {
+      method,
+      body: data ? JSON.stringify(data) : undefined
+    });
+  }
+
+  /** Replaces the highly specific `secureAdminAction` for Human Review */
+  async reviewGrievance(threadId: string, decision: 'APPROVED' | 'REJECTED', notes: string = "Processed via Admin Panel") {
+    return this.request(`/v1/admin/review/${threadId}`, {
+      method: 'POST',
+      body: JSON.stringify({ decision, notes })
+    });
+  }
+
+  /** Replaces the standalone `/ready` healthcheck */
+  async checkHealth() {
+    // Note: Healthchecks usually sit at the root level, not under /v1/admin/
+    return this.request('/ready', { method: 'GET' });
   }
 
   async rejectGrievance(threadId: string, reason: string) {
@@ -247,11 +287,26 @@ class ApiClient {
     return this.request<AdminUser[]>('/v1/admin/users', { method: 'GET' });
   }
 
+  async fetchCitizens() {
+    return this.request<any[]>('/v1/admin/citizens', { method: 'GET' });
+  }
+
   async createUser(userData: any) {
     return this.request('/v1/admin/users', {
       method: 'POST',
       body: JSON.stringify(userData)
     });
+  }
+
+  async updateUser(userId: string, userData: any) {
+    return this.request(`/v1/admin/users/${userId}`, {
+      method: 'PUT',
+      body: JSON.stringify(userData)
+    });
+  }
+
+  async deleteUser(userId: string) {
+    return this.request(`/v1/admin/users/${userId}`, { method: 'DELETE' });
   }
 
   async fetchAuditLogs() {
