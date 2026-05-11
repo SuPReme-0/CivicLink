@@ -242,7 +242,6 @@ async def _check_dispatch_circuit(target: str) -> bool:
     ) as cursor:
         row = await cursor.fetchone()
         return (row[0] if row else 0) >= 3
-
 # ---------------------------------------------------------
 # 4. THE GRAPH NODE
 # ---------------------------------------------------------
@@ -257,7 +256,11 @@ async def dispatch_node(state: CivicLinkState, config: RunnableConfig) -> dict:
     execution_ts = datetime.now(timezone.utc)
     
     if not drafted.get("subject") or not contact.get("officialEmail"):
-        return {"dispatch_status": "FAILED", "status_updates": [{"node": "dispatch", "action": "missing_data", "ts": execution_ts.isoformat()}]}
+        return {
+            "current_status": "FAILED", # 🚨 FIXED
+            "dispatch_status": "FAILED", 
+            "status_updates": [{"node": "dispatch", "action": "missing_data", "ts": execution_ts.isoformat()}]
+        }
     
     idempotency_key = _generate_idempotency_key(state)
     if await _check_idempotency(idempotency_key):
@@ -282,7 +285,6 @@ async def dispatch_node(state: CivicLinkState, config: RunnableConfig) -> dict:
                     image_payload
                 )
                 
-                # 🚨 Validated DKIM prepending behavior is standard and correct
                 if getattr(settings, "DKIM_ENABLED", False) and getattr(settings, "DKIM_PRIVATE_KEY", None):
                     signed_bytes = dkim.sign(
                         message=msg.as_bytes(), selector=settings.DKIM_SELECTOR.encode(),
@@ -317,7 +319,18 @@ async def dispatch_node(state: CivicLinkState, config: RunnableConfig) -> dict:
             existing_metrics = state.get("confidence_metrics", {})
             updated_metrics = {**existing_metrics, "dispatch_success": 1.0 if final_status in ("DELIVERED", "PORTAL_SUBMITTED") else 0.0}
             
+            # 🚨 ENHANCEMENT: Final Conversational Reply for the UI
+            target_name = contact.get("officialDesignation", "the relevant authorities")
+            if final_status in ("DELIVERED", "PORTAL_SUBMITTED"):
+                final_reply = f"Success! Your grievance (Tracking ID: {tracking_id}) has been officially dispatched to the {target_name}. You will be notified of any updates."
+            elif final_status == "RETRYING":
+                final_reply = "The dispatch server is currently busy. I have queued your grievance and will automatically retry sending it shortly."
+            else:
+                final_reply = "I encountered a technical issue while attempting to dispatch your grievance. It has been flagged for administrative review."
+
             return {
+                "current_status": final_status, # 🚨 FIXED: Sync overarching API state
+                "conversational_reply": final_reply, # 🚨 FIXED: Give the citizen a final answer
                 "dispatch_status": final_status,
                 "final_dispatch_id": portal_ticket or tracking_id,
                 "dispatch_channel": "PORTAL_FORM" if portal_submitted else "SMTP",
@@ -333,6 +346,8 @@ async def dispatch_node(state: CivicLinkState, config: RunnableConfig) -> dict:
             logger.exception(f"Dispatch failure: {e}")
             span.record_exception(e)
             return {
+                "current_status": "FAILED", # 🚨 FIXED
+                "conversational_reply": "A critical system error occurred during dispatch. Admin review required.",
                 "dispatch_status": "FAILED",
                 "retry_count": current_retry + 1,
                 "tracking_id": tracking_id, 

@@ -1,18 +1,27 @@
 import asyncio
 import base64
-import logging
-import warnings
+import httpx
+import os
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime
 
-# 🛑 Mute all background noise and deprecation warnings
-warnings.filterwarnings("ignore", module="google.generativeai")
-logging.getLogger().setLevel(logging.CRITICAL) 
-logging.getLogger("civiclink_api").setLevel(logging.CRITICAL)
+from dotenv import load_dotenv
+load_dotenv()
 
-from backend.brain.workflow import build_civiclink_graph
-from backend.core.db import prisma
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+API_BASE_URL = "http://localhost:8000/api/v1"
+FRONTEND_API_KEY = os.getenv("FRONTEND_API_KEY", "civiclink_dev_super_secret_998877")
 
+BASE_HEADERS = {
+    "Content-Type": "application/json",
+    "X-Frontend-API-Key": FRONTEND_API_KEY
+}
+
+# ==============================================================================
+# UTILITIES
+# ==============================================================================
 def get_image_data_uri(filepath: str) -> str:
     path = Path(filepath)
     if not path.exists():
@@ -21,116 +30,164 @@ def get_image_data_uri(filepath: str) -> str:
     with open(path, "rb") as f:
         encoded = base64.b64encode(f.read()).decode("utf-8")
     ext = path.suffix.lower().replace(".", "")
+    if ext == "jpg": ext = "jpeg"
     return f"data:image/{ext};base64,{encoded}"
 
-async def stream_turn(graph, input_state: dict, config: dict, turn_number: int):
-    """Streams a single conversational turn and prints a clean UI."""
-    print(f"\n👤 CITIZEN [Turn {turn_number}]: {input_state.get('user_input', '[Image Uploaded]')}")
-    print("--------------------------------------------------")
+async def authenticate_citizen(client: httpx.AsyncClient, username: str, phone: str):
+    print(f"\n[SYSTEM] Authenticating Citizen Identity: {username}...")
+    reg_payload = {"username": username, "password": "securepassword123", "phone_number": phone}
+    try:
+        await client.post(f"{API_BASE_URL}/auth/citizen/register", json=reg_payload, headers=BASE_HEADERS)
+    except Exception:
+        pass 
     
-    requires_review = False
+    login_payload = {"username": username, "password": "securepassword123"}
+    res = await client.post(f"{API_BASE_URL}/auth/citizen/login", json=login_payload, headers=BASE_HEADERS)
     
-    async for event in graph.astream(input_state, config, stream_mode="updates"):
-        for node_name, state_updates in event.items():
-            
-            # 🚨 THE FIX: Make state_updates absolutely null-safe
-            if not isinstance(state_updates, dict):
-                state_updates = {}
-                
-            # If the node was just a chat, print the AI's reply
-            if "conversational_reply" in state_updates:
-                print(f"🤖 AI REPLY: {state_updates['conversational_reply']}")
-            
-            # If the pipeline fires, show the steps cleanly
-            if node_name == "vlm_verify" and "vlm_output" in state_updates:
-                print(f"✅ [FORENSICS] Image verified. Score: {state_updates.get('image_authenticity_score')}")
-                
-            elif node_name == "resolve_jurisdiction" and "jurisdiction_hierarchy" in state_updates:
-                j = state_updates["jurisdiction_hierarchy"]
-                print(f"✅ [JURISDICTION] Mapped to: {j.get('district')} -> {j.get('issueCategory')}")
-                
-            elif node_name == "discover_contact" and "primary_contact" in state_updates:
-                c = state_updates["primary_contact"]
-                print(f"✅ [OSINT] Found Official: {c.get('officialName')} ({c.get('officialEmail')})")
-                
-            elif node_name == "draft_letter" and "drafted_letter" in state_updates:
-                print(f"✅ [LEGAL DRAFT] Generated. Subject: {state_updates['drafted_letter'].get('subject')}")
-                
-            elif node_name == "verification_gate":
-                conf = state_updates.get('confidence_metrics', {}).get('pipeline_confidence')
-                print(f"✅ [GATEKEEPER] Overall Confidence: {conf}")
-                if state_updates.get('requires_human_review'):
-                    requires_review = True
-                    
-            elif node_name == "dispatch":
-                print(f"✅ [DISPATCH] Status: {state_updates.get('dispatch_status')} via {state_updates.get('dispatch_channel')}")
+    if res.status_code == 200:
+        data = res.json()
+        token = data.get("token") or data.get("access_token")
+        print("✅ Citizen authenticated. Secure JWT acquired.")
+        return token
+    else:
+        print(f"❌ FATAL: Could not log in citizen: {res.text}")
+        exit(1)
 
-    return requires_review
-
-async def main():
-    print("\n==================================================")
-    print("🚀 CIVICLINK MULTI-TURN CONVERSATION TEST")
-    print("==================================================")
+async def send_message(client: httpx.AsyncClient, payload: dict, turn: int, token: str):
+    text = payload.get("text_message", "[No Text]")
+    media = "[Image Attached]" if payload.get("image_url") else ""
+    print(f"\n👤 CITIZEN [Turn {turn}]: {text} {media}")
+    print("-" * 80)
     
-    print("\nLoading backend graph...")
-    graph = build_civiclink_graph()
-    config = {"configurable": {"thread_id": f"chat_test_{datetime.now().strftime('%H%M%S')}"}}
+    secure_headers = {
+        **BASE_HEADERS,
+        "Authorization": f"Bearer {token}"
+    }
     
     try:
-        if not prisma.is_connected():
-            await prisma.connect()
+        response = await client.post(f"{API_BASE_URL}/ingest", json=payload, headers=secure_headers)
+        if response.status_code != 200:
+            print(f"❌ API ERROR ({response.status_code}): {response.text}")
+            exit(1)
+    except httpx.ConnectError:
+        print("\n❌ FATAL: Cannot connect to Backend. Is Uvicorn running?")
+        exit(1)
 
-        # --- TURN 1: Initial Greeting ---
-        await stream_turn(graph, {
-            "session_id": "test_user_01",
-            "user_input": "Hi, I want to report a broken road that is causing accidents.",
-            "is_grievance_complete": False
-        }, config, 1)
-
-        # --- TURN 2: Providing Location ---
-        await stream_turn(graph, {
-            "user_input": "It is located in Kolkata, near the main market.",
-            "is_grievance_complete": False
-        }, config, 2)
-
-        # --- TURN 3: Uploading the Image (Triggers the Pipeline) ---
-        image_uri = get_image_data_uri("test.webp")
-        requires_review = await stream_turn(graph, {
-            "user_input": "Here is the photo of the pothole.",
-            "image_url": image_uri,
-            "location_raw": {"type": "gps", "lat": 22.5726, "lon": 88.3639},
-            "is_grievance_complete": True 
-        }, config, 3)
-
-        # --- HITL: Admin Approval (If Required) ---
-        if requires_review:
-            print("\n⚠️ PIPELINE PAUSED: Low confidence detected. Awaiting Admin Review.")
-            print("👨‍💻 Admin clicked 'Approve' on Dashboard. Resuming...")
-            
-            # Update state with Admin decision
-            graph.update_state(config, {"human_review_decision": "APPROVED"})
-            
-            # Resume graph with empty input
-            await stream_turn(graph, None, config, 4)
-
-        print("\n🎉 TEST COMPLETE!")
-
-    except Exception as e:
-        print(f"\n❌ FATAL ERROR: {e}")
-        
-    finally:
-        print("\n🧹 Cleaning up...")
-        if prisma.is_connected():
-            await prisma.disconnect()
-        # Clean up node resources gracefully
+async def poll_conversational_status(client: httpx.AsyncClient, thread_id: str, last_reply: str, token: str, terminal_states: list = None, require_terminal: bool = False):
+    terminal_states = terminal_states or []
+    last_state = "PENDING_DETAILS"
+    
+    secure_headers = {
+        **BASE_HEADERS,
+        "Authorization": f"Bearer {token}"
+    }
+    
+    while True:
         try:
-            from backend.brain.nodes.contact import shutdown_contact_discovery
-            from backend.brain.nodes.drafting import shutdown_drafting
-            from backend.brain.nodes.dispatch import shutdown_dispatch
-            await shutdown_contact_discovery()
-            await shutdown_drafting()
-            await shutdown_dispatch()
-        except: pass
+            response = await client.get(f"{API_BASE_URL}/status/{thread_id}", headers=secure_headers)
+            
+            if response.status_code == 200:
+                data = response.json()
+                current_state = data.get("current_state", "")
+                current_reply = data.get("reply_message", "")
+
+                # 1. Print Backend Node Progress
+                if current_state != last_state and current_state != "PENDING_DETAILS":
+                    state_colors = {
+                        "RECEIVED": "📥  [INGEST NODE]: Case permanently registered in database.",
+                        "VERIFYING_IMAGE": "👁️  [VLM NODE]: Analyzing image forensics...",
+                        "ROUTING_JURISDICTION": "🗺️  [JURISDICTION NODE]: Mapping 70B Georesolution...",
+                        "AWAITING_USER_INPUT": "⏸️  [AMBIGUITY GATE]: Location too vague. Halting graph...",
+                        "AUTONOMOUS_SEEDING": "🌱  [AGENTIC OSINT]: 70B deducing municipal hierarchy & seeding DB...",
+                        "DISCOVERING_CONTACT": "🕷️  [CONTACT SPIDER]: Geofenced crawl for official emails...",
+                        "DRAFTING_LETTER": "⚖️  [DRAFTING NODE]: Writing legal grievance & citing statutes...",
+                        "VERIFYING_DISPATCH": "🛡️  [VERIFICATION GATE]: Auditing confidence metrics...",
+                        "AWAITING_REVIEW": "⚠️  [GATEKEEPER]: Pipeline Paused. Routing to Human Review.",
+                        "LLM_RECOVERY_NEEDED": "🧠  [RECOVERY]: Node failed. Bouncing to LLM to ask user for help."
+                    }
+                    print("\n" + state_colors.get(current_state, f"⚙️  [STATE TRANSITION]: {current_state}"))
+                    last_state = current_state
+
+                # 2. Print live conversational updates
+                if current_reply and current_reply != last_reply:
+                    if current_reply == "Processing...":
+                        await asyncio.sleep(1)
+                        continue
+                        
+                    print(f"\n🤖 AI REPLY: {current_reply}")
+                    last_reply = current_reply
+                    
+                    if not require_terminal:
+                        return last_reply
+
+                # 3. Check for terminal/pausing states
+                if terminal_states and current_state in terminal_states:
+                    print("\n" + "="*80)
+                    print(f"🏁 PIPELINE HALTED. FINAL STATE: {current_state}")
+                    return last_reply
+                    
+        except Exception:
+            pass 
+
+        await asyncio.sleep(2)
+
+# ==============================================================================
+# MAIN EXECUTION
+# ==============================================================================
+async def main():
+    print("\n=====================================================================")
+    print("🚀 CIVICLINK HARD STRESS TEST: UTTAR PRADESH DEVELOPMENT AUTHORITY")
+    print("=====================================================================")
+    
+    thread_id = f"CLC-TEST-{datetime.now().strftime('%H%M%S')}"
+    phone_number = "+919988112233"
+    username = "Vikram_Singh"
+    last_reply = ""
+    
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        
+        citizen_jwt = await authenticate_citizen(client, username, phone_number)
+        
+        # --- TURN 1: Highly Urgent, Vague Location ---
+        await send_message(client, {
+            "thread_id": thread_id,
+            "phone_number": phone_number,
+            "text_message": "There is a massive crater in the middle of the road. It's extremely dangerous, bikes are skidding and cars are swerving into oncoming traffic."
+        }, 1, citizen_jwt)
+        last_reply = await poll_conversational_status(client, thread_id, last_reply, citizen_jwt)
+
+        # --- TURN 2: Image Upload + Pushback ---
+        image_uri = get_image_data_uri("test.webp")
+        await send_message(client, {
+            "thread_id": thread_id,
+            "phone_number": phone_number,
+            "text_message": "Here is the photo. I don't have time to drop a GPS pin, I'm driving to work. Just report it to the authorities right now.",
+            "image_url": image_uri,
+        }, 2, citizen_jwt)
+        
+        # Expected: VLM verification completes, then RAG hits the Ambiguity Gate and halts.
+        last_reply = await poll_conversational_status(client, thread_id, last_reply, citizen_jwt)
+
+        # --- TURN 3: Tricky Landmark Resolution (Noida, UP) ---
+        await send_message(client, {
+            "thread_id": thread_id,
+            "phone_number": phone_number,
+            "text_message": "Fine. It's located right below the Sector 62 Metro Station, near the Fortis Hospital intersection in Noida, UP. The road is completely caving in."
+        }, 3, citizen_jwt)
+        last_reply = await poll_conversational_status(client, thread_id, last_reply, citizen_jwt)
+
+        # --- TURN 4: Final Directive ---
+        await send_message(client, {
+            "thread_id": thread_id,
+            "phone_number": phone_number,
+            "text_message": "Yes, go ahead and submit the official report with all the legal penalties attached. This needs fixing today."
+        }, 4, citizen_jwt)
+        
+        terminal_states = ["AWAITING_REVIEW", "DELIVERED", "PORTAL_SUBMITTED", "RESOLVED", "FAILED", "REJECTED_FRAUD", "LLM_RECOVERY_NEEDED"]
+        await poll_conversational_status(client, thread_id, last_reply, citizen_jwt, terminal_states, require_terminal=True)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n⏹️ Test manually aborted.")

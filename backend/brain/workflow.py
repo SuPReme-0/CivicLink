@@ -13,19 +13,16 @@ from backend.brain.state import CivicLinkState
 from backend.brain.routing import ROUTING_EDGES
 
 # 🚨 IMPORTING THE REAL PRODUCTION NODES
-from backend.brain.nodes.verification_gate import verification_gate_node # 🚨 ADD THIS
+from backend.brain.nodes.verification_gate import verification_gate_node
 from backend.brain.nodes.ingest_node import ingest_node
 from backend.brain.nodes.vlm_verify import vlm_verify_node
 from backend.brain.nodes.jurisdiction import resolve_jurisdiction_node
+from backend.brain.nodes.osint_seeder import osint_seeder_node # 🚨 ADDED SEEDER
 from backend.brain.nodes.contact import contact_discovery_node
 from backend.brain.nodes.drafting import drafting_node
 from backend.brain.nodes.dispatch import dispatch_node
 
 logger = logging.getLogger(__name__)
-
-# =============================================================================
-# 🚧 PENDING NODES (To be built next)
-# =============================================================================
 
 async def human_review_node(state: CivicLinkState) -> dict:
     """
@@ -34,9 +31,6 @@ async def human_review_node(state: CivicLinkState) -> dict:
     """
     return {}
 
-# =============================================================================
-# 🏗️ GRAPH CONSTRUCTION & COMPILATION
-# =============================================================================
 def build_civiclink_graph():
     """
     Defines nodes, wires conditional edges, and compiles the workflow.
@@ -47,20 +41,21 @@ def build_civiclink_graph():
     workflow.add_node("ingest", ingest_node)
     workflow.add_node("vlm_verify", vlm_verify_node)
     workflow.add_node("resolve_jurisdiction", resolve_jurisdiction_node)
+    workflow.add_node("osint_seeder", osint_seeder_node) # 🚨 REGISTERED SEEDER
     workflow.add_node("discover_contact", contact_discovery_node)
     workflow.add_node("draft_letter", drafting_node)
     workflow.add_node("verification_gate", verification_gate_node)
     workflow.add_node("human_review", human_review_node)
     workflow.add_node("dispatch", dispatch_node)
     
-    # 2. Set Entry Point (Every user message hits ingest first)
+    # 2. Set Entry Point 
     workflow.set_entry_point("ingest")
     
     # 3. Wire Conditional Edges using our Central Routing Registry
-    # This ensures every node has a fail-safe fallback to Human Review
     workflow.add_conditional_edges("ingest", ROUTING_EDGES["ingest"])
     workflow.add_conditional_edges("vlm_verify", ROUTING_EDGES["vlm_verify"])
     workflow.add_conditional_edges("resolve_jurisdiction", ROUTING_EDGES["resolve_jurisdiction"])
+    workflow.add_conditional_edges("osint_seeder", ROUTING_EDGES["osint_seeder"]) # 🚨 WIRED SEEDER
     workflow.add_conditional_edges("discover_contact", ROUTING_EDGES["discover_contact"])
     workflow.add_conditional_edges("draft_letter", ROUTING_EDGES["draft_letter"])
     workflow.add_conditional_edges("verification_gate", ROUTING_EDGES["verification_gate"])
@@ -73,8 +68,6 @@ def build_civiclink_graph():
     # 5. Compile Graph with HARD INTERRUPTS
     compiled_graph = workflow.compile(
         checkpointer=memory,
-        # 🚨 This physically locks the background thread from executing any further 
-        # until an Admin explicitly resumes it via the /admin API.
         interrupt_before=["human_review"] 
     )
     

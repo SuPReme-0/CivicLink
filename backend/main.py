@@ -1,13 +1,3 @@
-# backend/main.py
-"""
-CivicLink Production API Gateway.
-- FastAPI with async lifespan management
-- OpenTelemetry tracing & metrics integration
-- LangGraph state and config orchestration
-- Graceful shutdown with task cancellation
-- Structured JSON & Orchestrator logging
-- HITL (Human-in-the-Loop) Resumption endpoints
-"""
 import os
 import sys
 import json
@@ -17,12 +7,15 @@ import warnings
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    
 from fastapi import FastAPI, BackgroundTasks, Depends, Request, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from prometheus_fastapi_instrumentator import Instrumentator
 
-# 🛑 Suppress the Google Generative AI deprecation warning polluting the terminal
+# 🛑 Suppress the Google Generative AI deprecation warning
 warnings.filterwarnings("ignore", module="google.generativeai")
 
 from backend.api.citizen_routes import citizen_router
@@ -30,15 +23,17 @@ from backend.api.admin_routes import admin_router
 from backend.core.config import settings
 from backend.core.db import connect_db, disconnect_db, prisma
 from backend.core.rate_limiter import rate_limiter
-from backend.core.observability import get_tracer, get_meter, shutdown_observability
-from backend.core.security import verify_frontend_auth, hash_phone_number
+from backend.core.observability import get_tracer, shutdown_observability
 
-# 🚨 Shutdown Hooks
+from backend.core.security import verify_frontend_auth, verify_system_key, hash_phone_number
+
 from backend.brain.nodes.contact import shutdown_contact_discovery
 from backend.brain.nodes.dispatch import shutdown_dispatch
 from backend.brain.nodes.drafting import shutdown_drafting
-
 from backend.brain.workflow import build_civiclink_graph
+
+# 🚨 REQUIRED FOR PRISMA JSON FIELDS
+from prisma import Json
 
 # =============================================================================
 # STRUCTURED LOGGING CONFIGURATION
@@ -66,18 +61,14 @@ def setup_logging():
     root_logger = logging.getLogger()
     root_logger.setLevel(log_level)
     
-    # Use standard formatting for the main application to keep it readable for devs
     handler = logging.StreamHandler(sys.stdout)
     if settings.ENVIRONMENT == "production":
         handler.setFormatter(JSONFormatter())
     else:
-        # Beautiful console formatting for local development
         formatter = logging.Formatter('%(asctime)s | %(levelname)-8s | %(name)s | %(message)s', datefmt='%H:%M:%S')
         handler.setFormatter(formatter)
         
     root_logger.addHandler(handler)
-    
-    # Silence noisy dependencies
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("prisma").setLevel(logging.WARNING)
@@ -115,7 +106,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.warning(f"⚠️ Observability initialization warning: {e}")
     
     try:
-        # Warm up LangGraph (compiles the graph and prepares the Checkpointer)
         app.state.graph = build_civiclink_graph()
         logger.info("✅ LangGraph compiled and ready.")
     except Exception as e:
@@ -128,7 +118,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield 
     
     logger.info("🛑 Shutting down CivicLink Backend...")
-    # 1. Cancel any pending background tasks
     pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
     if pending:
         logger.info(f"⏳ Cancelling {len(pending)} pending tasks...")
@@ -142,7 +131,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     try:
         await shutdown_contact_discovery()
         await shutdown_dispatch()
-        await shutdown_drafting() # 🚨 Prevents Groq Client memory leak
+        await shutdown_drafting()
         logger.info("✅ Node shutdown hooks completed")
     except Exception as e:
         logger.error("❌ Node shutdown failed", exc_info=e)
@@ -157,7 +146,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Shutdown complete.")
 
 # =============================================================================
-# FASTAPI INITIALIZATION
+# FASTAPI INITIALIZATION & MIDDLEWARE
 # =============================================================================
 
 app = FastAPI(
@@ -168,13 +157,17 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# =============================================================================
-# MIDDLEWARE
-# =============================================================================
+origins = settings.CORS_ORIGINS.split(",") if settings.CORS_ORIGINS else []
+if not origins or "*" in origins:
+    logger.warning("CORS_ORIGINS is empty or contains wildcard. Defaulting to strict localhost/Vercel.")
+    origins = [
+        "http://localhost:3000",
+        "https://civic-link.vercel.app" 
+    ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS.split(",") if settings.CORS_ORIGINS else ["http://localhost:3000"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -186,7 +179,6 @@ async def add_request_id(request: Request, call_next):
     request_id = request.headers.get("X-Request-ID") or f"req-{os.urandom(8).hex()}"
     logger_adapter = logging.LoggerAdapter(logger, {"request_id": request_id})
     
-    # Only log non-polling requests to keep the terminal clean
     if "/api/v1/status/" not in request.url.path:
         logger_adapter.info(f"📥 {request.method} {request.url.path}")
         
@@ -246,7 +238,6 @@ async def readiness_check():
 # =============================================================================
 
 async def execute_langgraph_workflow(payload: dict, request_id: str, is_resume: bool = False):
-    """Background task to run or RESUME the LangGraph workflow without blocking."""
     tracer = get_tracer("civiclink.workflow")
     thread_id = payload.get("thread_id")
     
@@ -261,7 +252,6 @@ async def execute_langgraph_workflow(payload: dict, request_id: str, is_resume: 
             }
             
             if not is_resume:
-                # 🚨 Initialize state ONLY if this is a brand new grievance
                 input_state = {
                     "session_id": payload.get("phone_number", "anonymous"),
                     "thread_id": thread_id,
@@ -273,18 +263,15 @@ async def execute_langgraph_workflow(payload: dict, request_id: str, is_resume: 
                     "retry_count": 0
                 }
                 
-                # Only update state if they ACTUALLY sent new media/location.
                 if payload.get("image_url"):
                     input_state["image_url"] = payload.get("image_url")
                 if payload.get("location"):
                     input_state["location_raw"] = payload.get("location")
             else:
-                # 🚨 If resuming from Human Review, pass None so memory checkpointer takes over seamlessly
                 input_state = None
             
             logger.info(f"\n⚙️ [ORCHESTRATOR] {'Resuming' if is_resume else 'Spinning up'} LangGraph for thread: {thread_id}")
             
-            # Stream the graph execution to catch exact node completions
             async for output in graph.astream(input_state, config=config):
                 for node_name, node_state in output.items():
                     logger.info(f"  └─ ✅ [NODE COMPLETED] {node_name.upper()}")
@@ -302,7 +289,7 @@ async def execute_langgraph_workflow(payload: dict, request_id: str, is_resume: 
 # API ROUTES
 # =============================================================================
 
-@app.post("/api/v1/ingest", dependencies=[Depends(verify_frontend_auth)], tags=["ingestion"])
+@app.post("/api/v1/ingest", dependencies=[Depends(verify_system_key)], tags=["ingestion"])
 async def ingest_grievance(request: Request, background_tasks: BackgroundTasks):
     payload = await request.json()
     request_id = request.headers.get("X-Request-ID", "unknown")
@@ -311,36 +298,108 @@ async def ingest_grievance(request: Request, background_tasks: BackgroundTasks):
     if not raw_phone:
         return JSONResponse(status_code=400, content={"status": "error", "message": "Phone number/User ID required"})
         
-    payload["phone_number"] = hash_phone_number(raw_phone)
-    
-    # Hand off to LangGraph
+    hashed_phone = hash_phone_number(raw_phone)
+    payload["phone_number"] = hashed_phone
+
+    thread_id = payload.get("thread_id")
+    text_message = payload.get("text_message", "")
+
+    # =========================================================================
+    # 🚨 1. BULLETPROOF INSTANT THREAD ANCHORING 
+    # =========================================================================
+    if thread_id:
+        try:
+            citizen = await prisma.citizen.find_first(
+                where={
+                    "OR": [
+                        {"phoneHash": hashed_phone},
+                        {"username": raw_phone} 
+                    ]
+                }
+            )
+
+            # 🚨 FIX: Auto-provision fallback if the race condition hides the citizen
+            if not citizen:
+                logger.warning(f"Citizen not found for {raw_phone}. Auto-provisioning anchor...")
+                try:
+                    citizen = await prisma.citizen.create(
+                        data={
+                            "phoneHash": hashed_phone,
+                            "encryptedPhone": "AUTOGENERATED_FALLBACK",
+                            "username": f"User_{os.urandom(3).hex().upper()}",
+                            "trustScore": 1.0,
+                            "encryptionKeyVer": "v1"
+                        }
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to auto-provision citizen: {e}")
+                    return JSONResponse(status_code=500, content={"status": "error", "message": "Failed to anchor identity"})
+
+            if citizen:
+                existing_thread = await prisma.grievancethread.find_unique(
+                    where={"threadId": thread_id}
+                )
+                
+                if not existing_thread:
+                    try:
+                        await prisma.grievancethread.create(
+                            data={
+                                "threadId": thread_id, 
+                                "citizenId": citizen.id
+                            }
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to create parent GrievanceThread: {e}")
+
+                existing_case = await prisma.grievancecase.find_unique(
+                    where={"threadId": thread_id}
+                )
+
+                if not existing_case:
+                    await prisma.grievancecase.create(
+                        data={
+                            "trackingId": f"CLC-{os.urandom(4).hex().upper()}",
+                            "threadId": thread_id,
+                            "citizenId": citizen.id,
+                            "status": "RECEIVED",
+                            "issueCategory": "PENDING_TRIAGE",
+                            "descriptionText": text_message[:150], 
+                            "severity": "LOW",
+                            # 🚨 FIX: Prisma strongly types JSON. We MUST wrap payload in Json()
+                            "rawInputPayload": Json(payload) 
+                        }
+                    )
+                
+        except Exception as e:
+            logger.error(f"Database Anchoring Blocked (FK/Serialization Constraint): {e}")
+            
+    # 🚨 2. FIRE THE LANGGRAPH ORCHESTRATOR
     background_tasks.add_task(execute_langgraph_workflow, payload, request_id)
     
     return {
         "status": "success", 
         "message": "Grievance queued for AI processing",
-        "thread_id": payload.get("thread_id")
+        "thread_id": thread_id
     }
 
 @app.get("/api/v1/status/{thread_id}", tags=["status"])
 async def get_grievance_status(thread_id: str):
-    """Fetches real-time status from BOTH LangGraph memory and the Database."""
-    
-    # 1. Check LangGraph's active conversational memory first
     graph = app.state.graph
     config = {"configurable": {"thread_id": thread_id}}
-    current_state = await graph.aget_state(config)
     
-    state_values = current_state.values if current_state else {}
+    try:
+        current_state = await graph.aget_state(config)
+        state_values = current_state.values if current_state else {}
+    except Exception:
+        state_values = {}
+        
     ai_reply = state_values.get("conversational_reply")
     
-    # 2. Check the permanent database
-    case = await prisma.grievancecase.find_first(
-        where={"trackingId": thread_id},
+    case = await prisma.grievancecase.find_unique(
+        where={"threadId": thread_id},
         include={"dispatchRecords": True}
     )
     
-    # If there is no case yet, just return the AI's conversational reply
     if not case:
         return {
             "status": "chatting", 
@@ -348,7 +407,6 @@ async def get_grievance_status(thread_id: str):
             "reply_message": ai_reply or "Processing..."
         }
         
-    # If the case exists, return the full official status
     return {
         "status": "found",
         "current_state": case.status,
@@ -391,24 +449,49 @@ async def retry_graph_node(thread_id: str, node_id: str):
 
 @app.post("/api/v1/admin/review/{thread_id}", dependencies=[Depends(verify_frontend_auth)], tags=["admin"])
 async def admin_review_decision(thread_id: str, payload: dict, background_tasks: BackgroundTasks):
-    """
-    🚨 HITL RESUME ENDPOINT: Admin hits 'Approve' or 'Reject' on the dashboard.
-    This injects the decision into state and kickstarts the graph again.
-    """
     decision = payload.get("decision")
     if decision not in ["APPROVED", "REJECTED"]:
-        return JSONResponse(status_code=400, content={"error": "Decision must be APPROVED or REJECTED"})
+        return JSONResponse(status_code=400, content={"error": "Invalid Decision"})
         
     graph = app.state.graph
     config = {"configurable": {"thread_id": thread_id}}
     
-    # 1. Trick LangGraph into thinking the 'human_review' node just finished and returned this state
+    # 1. Resume the LangGraph AI
     await graph.aupdate_state(config, {"human_review_decision": decision}, as_node="human_review")
-    
-    # 2. Fire the background worker with is_resume=True to wake the pipeline back up
     background_tasks.add_task(execute_langgraph_workflow, {"thread_id": thread_id}, f"resume-{thread_id}", True)
     
-    return {"status": "success", "message": f"Graph resumed with decision: {decision}"}
+    # 🚨 2. WRITE TO THE IMMUTABLE AUDIT LOG
+    try:
+        # Retrieve the case to get its actual DB ID
+        case = await prisma.grievancecase.find_unique(where={"threadId": thread_id})
+        
+        await prisma.systemauditlog.create(
+            data={
+                "actor": "Admin API", # In production, extract Admin Name from JWT Token
+                "actorRole": "REVIEWER", 
+                "action": f"REVIEW_{decision}",
+                "severity": "SUCCESS" if decision == "APPROVED" else "WARNING",
+                "target": f"Thread: {thread_id}",
+                "details": f"Human-in-the-Loop decision processed. Result: {decision}",
+                "ip": "INTERNAL",
+                # Generate a pseudo-cryptographic seal
+                "immutableHash": f"SEAL-{os.urandom(16).hex()}" 
+            }
+        )
+        
+        # Also update the GrievanceCase with the accountability record
+        if case:
+            await prisma.grievancecase.update(
+                where={"threadId": thread_id},
+                data={
+                    "reviewDecision": decision,
+                    "reviewedAt": datetime.utcnow().isoformat() + "Z"
+                }
+            )
+    except Exception as e:
+        logger.error(f"Failed to write audit log: {e}")
+    
+    return {"status": "success"}
 
 @app.get("/api/v1/admin/stream", tags=["admin", "sse"])
 async def admin_sse_stream(request: Request):
@@ -435,3 +518,8 @@ async def global_exception_handler(request: Request, exc: Exception):
 @app.get("/", tags=["root"], response_class=PlainTextResponse)
 async def root():
     return f"CivicLink API v{settings.APP_VERSION}\nEnvironment: {settings.ENVIRONMENT}\nDocs: /docs"
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("backend.main:app", host="0.0.0.0", port=port, reload=True)

@@ -1,20 +1,24 @@
-// app/providers.tsx
 'use client';
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { ReactQueryDevtools } from '@tanstack/react-query-devtools';
+import { Toaster } from 'react-hot-toast'; // Run: npm install react-hot-toast
 import { useState } from 'react';
 
 export default function Providers({ children }: { children: React.ReactNode }) {
-  // We use useState to ensure the QueryClient is only instantiated once per session,
-  // preventing data loss during React component re-renders.
   const [queryClient] = useState(
     () =>
       new QueryClient({
         defaultOptions: {
           queries: {
-            staleTime: 60 * 1000, // Data remains fresh for 1 minute
-            refetchOnWindowFocus: false, // Prevents spamming your FastAPI backend
-            retry: 1,
+            staleTime: 30 * 1000, 
+            gcTime: 1000 * 60 * 60 * 24, // Keep in cache for 24h
+            refetchOnWindowFocus: false,
+            retry: (failureCount, error: any) => {
+              // Don't retry if the backend specifically says it's a validation error
+              if (error?.status === 422) return false;
+              return failureCount < 2;
+            },
           },
         },
       })
@@ -23,6 +27,15 @@ export default function Providers({ children }: { children: React.ReactNode }) {
   return (
     <QueryClientProvider client={queryClient}>
       {children}
+      {/* Production Toast Notifications */}
+      <Toaster 
+        position="top-right"
+        toastOptions={{
+          className: 'glass-card text-white border-white/10',
+          style: { background: '#0f0f13', color: '#fff', border: '1px solid rgba(255,255,255,0.1)' },
+        }}
+      />
+      {process.env.NODE_ENV === 'development' && <ReactQueryDevtools initialIsOpen={false} />}
     </QueryClientProvider>
   );
 }

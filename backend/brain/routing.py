@@ -1,12 +1,11 @@
-# backend/brain/routing.py
 """
 Production Conditional Edge Logic for CivicLink LangGraph.
 
 ARCHITECTURAL PRINCIPLES:
 - Pure functions: Read state -> return Literal NextNode string.
 - Zero State Mutation: Edges NEVER update state.
-- Conversational Pausing: If the AI gatekeeper needs more info, we halt (__end__).
-- Fail-Closed: Unrecognized or missing critical state routes to human_review, NOT __end__.
+- Circuit Breaker: If ANY downstream node fails or exhausts retries, we return "__end__".
+  This physically halts the graph, prevents infinite loops, and protects API quotas.
 """
 import logging
 from typing import Literal
@@ -20,7 +19,7 @@ logger = logging.getLogger(__name__)
 # TYPE ALIASES FOR STRICT ROUTING
 # ---------------------------------------------------------
 NextNode = Literal[
-    "ingest", "vlm_verify", "resolve_jurisdiction", "discover_contact",
+    "ingest", "vlm_verify", "resolve_jurisdiction", "osint_seeder", "discover_contact",
     "draft_letter", "verification_gate", "dispatch", "human_review", "__end__"
 ]
 
@@ -45,114 +44,120 @@ def route_after_vlm_verify(state: CivicLinkState) -> NextNode:
         return "__end__"
 
     if not state.get("is_grievance_complete", False):
-        logger.info("Router: Forensics complete. Looping back to Ingest for conversation.")
         return "ingest"
 
     auth_score = state.get("image_authenticity_score")
     severity = state.get("severity_level", "MEDIUM")
-    
-    # 🚨 FIX: Safe dictionary fallback for thresholds to prevent AttributeError
     thresholds = getattr(settings, "SEVERITY_THRESHOLDS", {"LOW": 0.6, "HIGH": 0.8})
     
-    if auth_score is None or auth_score == 0.0:
-        logger.warning("Router: Suspicious or missing auth score. Routing to Human Review.")
-        return "human_review"
-    
-    # Standard threshold check for normal grievances
-    if auth_score < thresholds.get("LOW", 0.6):
-        logger.info(f"Router: Low auth score ({auth_score}). Routing to Human Review.")
-        return "human_review"
+    # 🚨 CIRCUIT BREAKER: Halt if VLM fails criteria
+    if auth_score is None or auth_score == 0.0 or auth_score < thresholds.get("LOW", 0.6):
+        logger.warning("Router: VLM rejected image. Halting graph.")
+        return "__end__"
         
-    # 🚨 FIX: Strict gate for high-severity claims. If it's critical but the image looks 
-    # slightly manipulated (score < 0.8), force a human to look at it immediately.
     if auth_score < thresholds.get("HIGH", 0.8) and severity in ("HIGH", "CRITICAL"):
-        logger.info(f"Router: High severity claim with mediocre auth score ({auth_score}). Routing to Human Review.")
-        return "human_review"
+        logger.warning("Router: High severity but low image confidence. Halting graph.")
+        return "__end__"
     
-    # All verified images now properly continue down the pipeline
     return "resolve_jurisdiction"
 
 
 def route_after_jurisdiction(state: CivicLinkState) -> NextNode:
-    if state.get("current_status") == "FAILED":
+    status = state.get("current_status")
+    
+    # 🚨 CIRCUIT BREAKER: Halt on Ambiguity or Failure
+    if status in ["FAILED", "PENDING_DETAILS", "AWAITING_USER_INPUT"]:
+        logger.info("Router: Location ambiguous or RAG failed. Halting graph.")
         return "__end__"
 
-    hierarchy = state.get("jurisdiction_hierarchy", {})
-    confidence = state.get("confidence_metrics", {}).get("jurisdiction", 0.0)
+    hierarchy = state.get("jurisdiction_hierarchy") or {}
+    metrics = state.get("confidence_metrics") or {}
+    confidence = metrics.get("jurisdiction", 0.0)
+    seeder_retries = state.get("seeder_retry_count", 0)
     
-    if not hierarchy or not hierarchy.get("district"):
-        logger.warning("Router: Jurisdiction mapping failed. Routing to Human Review.")
-        return "human_review"
+    if not hierarchy or not hierarchy.get("district") or confidence < 0.7:
+        if seeder_retries < 3:
+            logger.info(f"Router: Jurisdiction low confidence. Launching OSINT Seeder (Attempt {seeder_retries + 1}/3)")
+            return "osint_seeder"
+        else:
+            logger.warning("Router: OSINT Seeder exhausted 3 attempts. Halting graph.")
+            return "__end__"
+
+    return "discover_contact"
+
+
+def route_after_osint_seeder(state: CivicLinkState) -> NextNode:
+    status = state.get("current_status")
     
-    if confidence < 0.7:
-        return "human_review"
+    # 🚨 CIRCUIT BREAKER
+    if status in ["FAILED", "LLM_RECOVERY_NEEDED", "AWAITING_REVIEW"]:
+        logger.warning(f"Router: Seeder failed with status {status}. Halting graph.")
+        return "__end__"
     
     return "discover_contact"
 
 
 def route_after_contact_discovery(state: CivicLinkState) -> NextNode:
-    if state.get("current_status") == "FAILED":
+    status = state.get("current_status")
+    
+    # 🚨 CIRCUIT BREAKER
+    if status in ["FAILED", "AWAITING_REVIEW", "LLM_RECOVERY_NEEDED"]:
+        logger.warning(f"Router: Spider failed with status {status}. Halting graph.")
         return "__end__"
 
-    contacts = state.get("discovered_contacts", [])
-    primary = state.get("primary_contact")
-    retry_count = state.get("retry_count", 0)
-    max_retries = state.get("max_retries", 3)
-    
-    if primary and primary.get("verification_status") == "VERIFIED":
+    primary = state.get("primary_contact") or {}
+    if primary and primary.get("officialEmail"):
         return "draft_letter"
     
-    # Relies on contact.py properly incrementing the retry_count in the state
-    if contacts and retry_count < max_retries:
-        return "discover_contact" 
+    if status == "SEEDER_RETRY":
+        seeder_retries = state.get("seeder_retry_count", 0)
+        if seeder_retries < 3:
+            logger.warning(f"Router: Spider found no emails. Looping back to Seeder (Attempt {seeder_retries}/3)")
+            return "osint_seeder"
+        else:
+            logger.warning("Router: Seeder retries exhausted. Halting graph.")
+            return "__end__"
+            
+    spider_retries = state.get("retry_count", 0)
+    max_retries = state.get("max_retries", 3)
     
-    if state.get("fallback_portal_url") or state.get("dispatch_channel") == "PORTAL_FORM":
-        return "draft_letter" 
+    if status == "RETRYING" and spider_retries < max_retries:
+        logger.warning(f"Router: Spider execution failed. Retrying scrape (Attempt {spider_retries + 1}/{max_retries})")
+        return "discover_contact"
     
-    logger.warning("Router: Contact discovery exhausted. Routing to Human Review.")
-    return "human_review"
+    logger.warning(f"Router: Unhandled spider state '{status}'. Halting graph.")
+    return "__end__"
 
 
 def route_after_draft_letter(state: CivicLinkState) -> NextNode:
+    # 🚨 CIRCUIT BREAKER
     if state.get("current_status") == "FAILED":
+        logger.warning("Router: Drafting failed (API Limits/Error). Halting graph.")
         return "__end__"
 
-    drafted = state.get("drafted_letter")
-
+    drafted = state.get("drafted_letter") or {}
     if not drafted or not drafted.get("subject"):
-        return "human_review"
+        logger.warning("Router: Drafting completed but letter is empty. Halting graph.")
+        return "__end__"
     
     return "verification_gate"
 
-
 def route_after_verification_gate(state: CivicLinkState) -> NextNode:
+    # 1. Check for hard node failures first
     if state.get("current_status") == "FAILED":
+        logger.warning("Router: Verification Gate node crashed. Halting graph.")
         return "__end__"
 
-    auth_score = state.get("image_authenticity_score", 1.0)
-    severity = state.get("severity_level", "MEDIUM")
-    confidence = state.get("confidence_metrics", {}).get("pipeline_confidence", 1.0)
-    
+    # 2. 🚨 THE FIX: Read the hard boolean, ignore the volatile string
     requires_human = state.get("requires_human_review", False)
-    retry_count = state.get("retry_count", 0)
     
-    if requires_human:
-        return "human_review"
-    
-    if severity == "CRITICAL" and confidence >= 0.9:
-        return "dispatch" 
-    
-    if auth_score < 0.7 or confidence < 0.7:
-        return "human_review"
-    
-    if severity in ("HIGH", "CRITICAL") and confidence < 0.9:
-        return "human_review"
-    
-    if retry_count >= state.get("max_retries", 3):
-        return "human_review"
-    
-    return "dispatch"
-
+    if not requires_human:
+        logger.info("Router: Gate approved (requires_human=False). Routing to Dispatch.")
+        return "dispatch"
+        
+    # If requires_human is True (or if something else went wrong)
+    logger.warning(f"Router: Verification Gate flagged pipeline (requires_human={requires_human}). Halting graph.")
+    return "__end__"
 
 def route_after_dispatch(state: CivicLinkState) -> NextNode:
     dispatch_status = state.get("dispatch_status")
@@ -164,39 +169,24 @@ def route_after_dispatch(state: CivicLinkState) -> NextNode:
     
     if dispatch_status in ("QUEUED", "RETRYING") and retry_count < max_retries:
         return "dispatch"
-    
+        
+    # 🚨 CIRCUIT BREAKER
+    logger.warning("Router: Dispatch completely failed or exhausted retries. Halting graph.")
     return "__end__"
 
 
 def route_after_human_review(state: CivicLinkState) -> NextNode:
-    decision = state.get("human_review_decision")
-    
-    if decision != "APPROVED":
-        return "__end__" 
-    
-    # 🚨 SMART RESUMPTION: Figure out where the pipeline was interrupted 
-    # and resume at the earliest missing step.
-    
-    # 1. If Jurisdiction is missing, resume there
-    if not state.get("jurisdiction_hierarchy", {}).get("district"):
-        return "resolve_jurisdiction"
-        
-    # 2. If Jurisdiction exists but Contact is missing, resume Contact Discovery
-    if not state.get("primary_contact", {}).get("officialEmail"):
-        return "discover_contact"
-        
-    # 3. If Contact exists but Letter is missing, resume Drafting
-    if not state.get("drafted_letter", {}).get("subject"):
-        return "draft_letter"
-        
-    # 4. If everything is present (e.g. paused purely due to Verification Gate severity)
-    return "dispatch"
+    """Dummy node strictly to satisfy `workflow.py` hardcoded edges."""
+    return "ingest"
 
-# Central registry for workflow.py wiring
+# ---------------------------------------------------------
+# CENTRAL REGISTRY 
+# ---------------------------------------------------------
 ROUTING_EDGES = {
     "ingest": route_after_ingest,
     "vlm_verify": route_after_vlm_verify,
     "resolve_jurisdiction": route_after_jurisdiction,
+    "osint_seeder": route_after_osint_seeder,
     "discover_contact": route_after_contact_discovery,
     "draft_letter": route_after_draft_letter,
     "verification_gate": route_after_verification_gate,

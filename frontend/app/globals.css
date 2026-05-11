@@ -3,54 +3,47 @@
 @tailwind utilities;
 
 /* =============================================================================
-   DESIGN TOKENS: CSS Variables for Dynamic Theming
+   DESIGN TOKENS: "Amethyst & Crimson" Professional Palette
    ============================================================================= */
 :root {
-  /* Core Colors */
-  --background: #030305;
+  /* Core Aesthetic Palette */
+  --background: #0a040d; /* Very deep, dark purple/black */
   --foreground: #f8fafc;
-  --primary: #6366f1; /* Indigo-500 */
-  --primary-glow: rgba(99, 102, 241, 0.35);
-  --secondary: #8b5cf6;
-  --secondary-glow: rgba(139, 92, 246, 0.25);
   
-  /* Glassmorphism Base */
-  --glass-bg: rgba(10, 10, 15, 0.55);
-  --glass-bg-hover: rgba(20, 20, 30, 0.75);
-  --glass-border: rgba(255, 255, 255, 0.08);
-  --glass-border-hover: rgba(99, 102, 241, 0.3);
-  --glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  /* Primary: Elegant Purple */
+  --primary: #9333ea; /* Purple-600 */
+  --primary-glow: rgba(147, 51, 234, 0.25);
   
-  /* Role-Specific Accents */
-  --customer-accent: #38bdf8; /* Light Blue for Citizens */
-  --customer-accent-glow: rgba(56, 189, 248, 0.3);
-  --admin-accent: #6366f1; /* Indigo for Admins */
-  --admin-accent-glow: rgba(99, 102, 241, 0.3);
+  /* Secondary: Deep Reddish/Rose Accent */
+  --secondary: #e11d48; /* Rose-600 */
+  --secondary-glow: rgba(225, 29, 72, 0.2);
   
-  /* Status Colors */
-  --status-success: #22c55e;
+  /* Precision Glass System */
+  --glass-bg: rgba(20, 10, 30, 0.45);
+  --glass-bg-hover: rgba(30, 15, 45, 0.65);
+  --glass-border: rgba(255, 255, 255, 0.05);
+  --glass-border-hover: rgba(225, 29, 72, 0.25);
+  --glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+  
+  /* Status Semantics - Muted for elegance */
+  --status-success: #10b981;
   --status-warning: #f59e0b;
   --status-error: #ef4444;
-  --status-info: #38bdf8;
+  --status-info: #8b5cf6;
   
-  /* Animation Timing */
-  --ease-snappy: cubic-bezier(0.16, 1, 0.3, 1);
+  /* Smooth Animation Curves */
+  --ease-snappy: cubic-bezier(0.2, 1, 0.3, 1);
   --ease-smooth: cubic-bezier(0.4, 0, 0.2, 1);
-  --ease-bounce: cubic-bezier(0.68, -0.55, 0.265, 1.55);
-  --ease-cyber: cubic-bezier(0.86, 0, 0.07, 1);
+  --ease-bounce: cubic-bezier(0.34, 1.56, 0.64, 1);
   
-  /* Blur & Depth */
-  --blur-sm: 4px;
+  /* Optical Blurs */
   --blur-md: 12px;
   --blur-lg: 24px;
   --blur-xl: 40px;
 }
 
-/* Reduced motion accessibility */
 @media (prefers-reduced-motion: reduce) {
-  *,
-  *::before,
-  *::after {
+  *, *::before, *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
@@ -59,7 +52,7 @@
 }
 
 /* =============================================================================
-   BASE STYLES & TYPOGRAPHY
+   BASE STYLES: Atmosphere & Geometry
    ============================================================================= */
 @layer base {
   * {
@@ -76,24 +69,26 @@
   body {
     background-color: var(--background);
     color: var(--foreground);
-    @apply antialiased;
+    @apply antialiased overflow-x-hidden;
     font-feature-settings: "cv02", "cv03", "cv04", "cv11";
     text-rendering: optimizeLegibility;
-    /* Subtle radial glow in the background */
+    
+    /* Professional Reddish-Purple Ambient Glow */
     background-image: 
-      radial-gradient(circle at 15% 50%, rgba(99, 102, 241, 0.04) 0%, transparent 50%),
-      radial-gradient(circle at 85% 30%, rgba(139, 92, 246, 0.04) 0%, transparent 50%);
+      radial-gradient(circle at 15% 0%, rgba(147, 51, 234, 0.08) 0%, transparent 45%),
+      radial-gradient(circle at 85% 100%, rgba(225, 29, 72, 0.06) 0%, transparent 45%),
+      radial-gradient(circle at 50% 50%, rgba(10, 4, 13, 1) 0%, transparent 100%);
     background-attachment: fixed;
   }
 
   ::selection {
-    @apply bg-indigo-500/40 text-white;
+    @apply bg-rose-500/30 text-white;
   }
 }
 
 @layer components {
   /* =============================================================================
-     GLASSMORPHISM UTILITIES
+     OPTICAL GLASS (Refined & Clean)
      ============================================================================= */
 
   .glass-panel {
@@ -105,51 +100,39 @@
 
   .glass-panel::before {
     content: '';
-    @apply absolute inset-0 bg-gradient-to-br from-white/[0.03] to-transparent pointer-events-none;
-    opacity: 0;
-    transition: opacity 0.3s var(--ease-snappy);
+    @apply absolute inset-0 pointer-events-none;
+    background: linear-gradient(135deg, rgba(255,255,255,0.06) 0%, transparent 30%, transparent 70%, rgba(255,255,255,0.01) 100%);
+    opacity: 0.5;
+    transition: opacity 0.4s var(--ease-smooth);
   }
 
   .glass-panel:hover {
     @apply border-[var(--glass-border-hover)] bg-[var(--glass-bg-hover)];
     transform: translateY(-2px);
-    box-shadow: 0 16px 40px var(--primary-glow);
+    box-shadow: 0 16px 40px -10px var(--primary-glow);
   }
 
   .glass-panel:hover::before {
     opacity: 1;
   }
 
-  .glass-panel:active {
-    transform: translateY(0);
-    transition-duration: 0.1s;
-  }
-
   .glass-input {
-    @apply w-full bg-black/40 backdrop-blur-md border border-white/10 
+    @apply w-full bg-black/40 backdrop-blur-md border border-white/5 
            rounded-xl px-4 py-3 text-[var(--foreground)] placeholder:text-white/30
-           focus:border-indigo-500/60 focus:ring-2 focus:ring-indigo-500/20 
-           focus:outline-none transition-all duration-300;
-  }
-
-  .glass-input::placeholder {
-    transition: opacity 0.2s;
-  }
-
-  .glass-input:focus::placeholder {
-    opacity: 0.6;
+           focus:border-rose-500/50 focus:ring-2 focus:ring-rose-500/10 
+           focus:bg-black/60 focus:outline-none transition-all duration-300;
   }
 
   /* =============================================================================
-     INTERACTIVE BUTTONS
+     BUTTONS: Sleek & Tactile
      ============================================================================= */
      
   .glass-btn {
     @apply relative inline-flex items-center justify-center gap-2 px-6 py-3 
-           bg-gradient-to-r from-[var(--primary)] to-blue-500 text-white font-medium 
+           bg-gradient-to-r from-[var(--primary)] to-[var(--secondary)] text-white font-medium 
            rounded-xl shadow-lg overflow-hidden transition-all duration-300
            border border-white/10 backdrop-blur-md
-           focus:outline-none focus:ring-2 focus:ring-[var(--primary-glow)] focus:ring-offset-2 focus:ring-offset-[var(--background)];
+           focus:outline-none focus:ring-2 focus:ring-[var(--secondary-glow)] focus:ring-offset-2 focus:ring-offset-[var(--background)];
     will-change: transform, box-shadow;
   }
 
@@ -157,11 +140,11 @@
     content: '';
     @apply absolute inset-0 bg-gradient-to-r from-transparent via-white/20 to-transparent;
     transform: translateX(-100%);
-    transition: transform 0.5s var(--ease-cyber);
+    transition: transform 0.6s var(--ease-smooth);
   }
 
   .glass-btn:hover {
-    @apply shadow-[0_0_20px_rgba(99,102,241,0.4)] border-indigo-400/50;
+    @apply shadow-[0_0_24px_rgba(225,29,72,0.3)] border-rose-400/40;
     transform: translateY(-1px);
   }
 
@@ -170,7 +153,7 @@
   }
 
   .glass-btn:active {
-    transform: translateY(1px);
+    transform: translateY(1px) scale(0.98);
     transition-duration: 0.1s;
   }
 
@@ -179,16 +162,8 @@
     transform: none !important;
   }
 
-  .glass-btn-customer {
-    @apply from-[var(--customer-accent)] to-cyan-500 focus:ring-[var(--customer-accent-glow)];
-  }
-
-  .glass-btn-admin {
-    @apply from-[var(--admin-accent)] to-purple-500 focus:ring-[var(--admin-accent-glow)];
-  }
-
   /* =============================================================================
-     CHAT INTERFACE (Citizen Portal)
+     CHAT & DASHBOARD INTERFACES
      ============================================================================= */
 
   .chat-container {
@@ -198,76 +173,31 @@
 
   .chat-bubble {
     @apply max-w-[85%] md:max-w-[70%] p-4 rounded-2xl backdrop-blur-md 
-           border border-white/10 shadow-lg animate-slide-up;
+           border border-white/5 shadow-lg animate-slide-up;
     will-change: transform, opacity;
   }
 
   .chat-bubble-in {
-    @apply chat-bubble bg-white/5 rounded-tl-none origin-bottom-left border-l-4 border-l-[var(--primary)];
+    @apply chat-bubble bg-white/[0.03] rounded-tl-none origin-bottom-left border-l-2 border-l-[var(--primary)];
   }
 
   .chat-bubble-out {
-    @apply chat-bubble bg-gradient-to-br from-indigo-500/30 to-purple-500/20 
-           text-indigo-50 rounded-tr-none origin-bottom-right ml-auto 
-           border-r-4 border-r-indigo-400;
+    @apply chat-bubble bg-gradient-to-br from-purple-600/20 to-rose-600/10 
+           text-purple-50 rounded-tr-none origin-bottom-right ml-auto 
+           border-r-2 border-r-[var(--secondary)];
   }
 
-  .typing-indicator {
-    @apply flex items-center gap-1 px-4 py-3;
-  }
-
-  .typing-dot {
-    @apply w-2 h-2 bg-white/60 rounded-full animate-bounce;
-    animation-delay: calc(var(--i) * 0.15s);
-  }
-  .typing-dot:nth-child(1) { --i: 1; }
-  .typing-dot:nth-child(2) { --i: 2; }
-  .typing-dot:nth-child(3) { --i: 3; }
-
-  .message-status {
-    @apply flex items-center gap-1 text-xs text-white/60 mt-1;
-  }
-  .status-sent { @apply text-white/60; }
-  .status-delivered { @apply text-[var(--status-success)]; }
-  .status-read { @apply text-[var(--primary)]; }
-
-  /* Removed 'group' to prevent Tailwind crash */
-  .attachment-preview {
-    @apply relative rounded-xl overflow-hidden border border-white/10 
-           bg-black/20 backdrop-blur-sm cursor-pointer;
-    transition: all 0.2s var(--ease-snappy);
-  }
-
-  .attachment-preview:hover {
-    @apply border-[var(--primary)] shadow-[var(--primary-glow)];
-    transform: scale(1.02);
-  }
-
-  .attachment-preview img {
-    @apply w-full h-32 object-cover transition-transform duration-300;
-  }
-
-  .attachment-preview:hover img {
-    transform: scale(1.05);
-  }
-
-  /* =============================================================================
-     ADMIN DASHBOARD (Mission Control)
-     ============================================================================= */
-
-  /* Removed 'group' to prevent Tailwind crash, handled hover manually */
   .metric-card {
-    @apply glass-panel p-5 rounded-2xl cursor-default flex flex-col justify-between relative overflow-hidden;
+    @apply glass-panel p-6 rounded-2xl cursor-default flex flex-col justify-between relative overflow-hidden;
   }
 
   .metric-card::after {
     content: '';
-    @apply absolute -bottom-1 left-0 w-full h-1 bg-gradient-to-r from-transparent via-[var(--admin-accent)] to-transparent opacity-0 transition-opacity duration-300;
+    @apply absolute -bottom-1 left-0 w-full h-1 bg-gradient-to-r from-transparent via-[var(--secondary)] to-transparent opacity-0 transition-opacity duration-500;
   }
 
   .metric-card:hover {
-    @apply border-[var(--admin-accent)];
-    box-shadow: 0 12px 48px var(--admin-accent-glow);
+    @apply border-[var(--glass-border-hover)];
   }
 
   .metric-card:hover::after {
@@ -275,27 +205,31 @@
   }
 
   .metric-value {
-    @apply text-3xl font-black bg-gradient-to-br from-white to-[var(--admin-accent)] 
+    @apply text-3xl font-black bg-gradient-to-br from-white to-[var(--secondary)] 
            bg-clip-text text-transparent transition-all duration-300 drop-shadow-sm;
   }
 
   .metric-label {
-    @apply text-sm text-white/60 transition-colors;
+    @apply text-sm text-white/50 transition-colors font-medium tracking-wide;
   }
+  
   .metric-card:hover .metric-label {
     @apply text-white/80;
   }
 
   .table-row {
-    @apply border-b border-white/5 bg-transparent hover:bg-indigo-500/[0.02] transition-all duration-300 cursor-pointer;
-    transform-origin: left;
+    @apply border-b border-white/5 bg-transparent hover:bg-rose-500/[0.02] transition-all duration-300 cursor-pointer;
   }
 
   .table-row:hover {
-    transform: translateX(4px);
-    border-left: 3px solid var(--admin-accent);
-    padding-left: calc(1.25rem - 3px);
+    @apply border-l-2 border-l-[var(--secondary)];
+    padding-left: 2px;
+    background: linear-gradient(90deg, rgba(225, 29, 72, 0.05) 0%, transparent 100%);
   }
+
+  /* =============================================================================
+     STATUS INDICATORS & UTILITIES
+     ============================================================================= */
 
   .status-badge {
     @apply inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold 
@@ -304,69 +238,42 @@
 
   .status-badge::before {
     content: '';
-    @apply w-1.5 h-1.5 rounded-full animate-pulse;
+    @apply w-1.5 h-1.5 rounded-full;
   }
 
-  .status-badge.received { @apply bg-blue-500/10 border-blue-500/30 text-blue-300; }
-  .status-badge.received::before { @apply bg-blue-400; }
-  .status-badge.verifying { @apply bg-yellow-500/10 border-yellow-500/30 text-yellow-300; }
-  .status-badge.verifying::before { @apply bg-yellow-400; }
-  .status-badge.dispatched { @apply bg-green-500/10 border-green-500/30 text-green-300; }
-  .status-badge.dispatched::before { @apply bg-green-400; animation: none; }
-  .status-badge.failed { @apply bg-red-500/10 border-red-500/30 text-red-300; }
-  .status-badge.failed::before { @apply bg-red-400; animation: none; }
-
-  /* Real-time Update Dot */
-  .live-indicator {
-    @apply flex items-center gap-2 text-xs font-medium text-[var(--status-success)];
-  }
+  .status-badge.received { @apply bg-purple-500/10 border-purple-500/20 text-purple-300; }
+  .status-badge.received::before { @apply bg-purple-400 animate-pulse; }
+  .status-badge.verifying { @apply bg-amber-500/10 border-amber-500/20 text-amber-300; }
+  .status-badge.verifying::before { @apply bg-amber-400 animate-pulse; }
+  .status-badge.dispatched { @apply bg-emerald-500/10 border-emerald-500/20 text-emerald-300; }
+  .status-badge.dispatched::before { @apply bg-emerald-400; }
+  .status-badge.failed { @apply bg-rose-500/10 border-rose-500/20 text-rose-300; }
+  .status-badge.failed::before { @apply bg-rose-400; }
 
   .live-dot {
     @apply w-2 h-2 rounded-full bg-[var(--status-success)] animate-pulse-ring;
   }
 
-  /* =============================================================================
-     LOADING & CONNECTION STATES
-     ============================================================================= */
-
   .loading-overlay {
-    /* Safe fallback using standard background color to avoid opacity crashes */
-    background-color: rgba(3, 3, 5, 0.9);
-    @apply fixed inset-0 backdrop-blur-md z-50 flex items-center justify-center;
+    @apply fixed inset-0 bg-[#0a040d]/80 backdrop-blur-md z-50 flex items-center justify-center;
   }
 
   .loading-spinner {
-    @apply w-12 h-12 border-4 border-[var(--glass-border)] border-t-[var(--primary)] 
-           border-l-[var(--primary)] rounded-full animate-spin shadow-[0_0_15px_rgba(99,102,241,0.5)];
-  }
-
-  .connection-bar {
-    @apply fixed top-0 left-0 right-0 h-1 z-50 transition-all duration-300;
-  }
-  .connection-bar.online { @apply bg-gradient-to-r from-[var(--status-success)] to-green-400; }
-  .connection-bar.offline { @apply bg-gradient-to-r from-[var(--status-error)] to-red-400; }
-  .connection-bar.reconnecting { 
-    @apply bg-gradient-to-r from-[var(--status-warning)] to-yellow-400;
-    animation: pulse-bar 1.5s infinite;
+    @apply w-12 h-12 border-4 border-white/5 border-t-[var(--secondary)] 
+           border-l-[var(--primary)] rounded-full animate-spin shadow-[0_0_20px_rgba(225,29,72,0.3)];
   }
 }
 
 /* =============================================================================
-   KEYFRAMES, ANIMATIONS & SCROLLBARS
+   KEYFRAMES & SCROLLBARS (Polished & Smooth)
    ============================================================================= */
 @layer utilities {
 
   @keyframes slide-up {
-    from { opacity: 0; transform: translateY(20px) scale(0.98); }
-    to { opacity: 1; transform: translateY(0) scale(1); }
+    from { opacity: 0; transform: translateY(15px) scale(0.99); filter: blur(2px); }
+    to { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
   }
-  .animate-slide-up { animation: slide-up 0.4s var(--ease-snappy) forwards; }
-
-  @keyframes bounce {
-    0%, 80%, 100% { transform: scale(0.6); opacity: 0.5; }
-    40% { transform: scale(1); opacity: 1; }
-  }
-  .animate-bounce { animation: bounce 1.4s var(--ease-bounce) infinite; }
+  .animate-slide-up { animation: slide-up 0.5s var(--ease-snappy) forwards; }
 
   @keyframes shimmer {
     100% { transform: translateX(100%); }
@@ -374,75 +281,22 @@
   .skeleton { @apply relative overflow-hidden bg-white/5 rounded-lg; }
   .skeleton::after {
     content: '';
-    @apply absolute inset-0 bg-gradient-to-r from-transparent via-white/10 to-transparent;
-    animation: shimmer 1.5s infinite;
+    @apply absolute inset-0 bg-gradient-to-r from-transparent via-white/5 to-transparent;
+    animation: shimmer 2s infinite;
     transform: translateX(-100%);
   }
 
   @keyframes pulse-ring {
-    0% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.4); }
-    70% { box-shadow: 0 0 0 8px transparent; }
+    0% { box-shadow: 0 0 0 0 rgba(225, 29, 72, 0.3); }
+    70% { box-shadow: 0 0 0 6px transparent; }
     100% { box-shadow: 0 0 0 0 transparent; }
   }
-  .animate-pulse-ring { animation: pulse-ring 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+  .animate-pulse-ring { animation: pulse-ring 2.5s var(--ease-smooth) infinite; }
 
   @keyframes spin { to { transform: rotate(360deg); } }
-  .animate-spin { animation: spin 1s linear infinite; }
+  .animate-spin { animation: spin 1.2s linear infinite; }
 
-  @keyframes pulse-bar {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.6; }
-  }
-
-  @keyframes shake {
-    10%, 90% { transform: translate3d(-1px, 0, 0); }
-    20%, 80% { transform: translate3d(2px, 0, 0); }
-    30%, 50%, 70% { transform: translate3d(-4px, 0, 0); }
-    40%, 60% { transform: translate3d(4px, 0, 0); }
-  }
-  .animate-shake { animation: shake 0.4s cubic-bezier(.36,.07,.19,.97) both; }
-
-  /* Cyber Glitch Effect */
-  .glitch-text {
-    position: relative;
-    display: inline-block;
-  }
-  .glitch-text::before, .glitch-text::after {
-    content: attr(data-text);
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    opacity: 0.8;
-  }
-  .glitch-text::before {
-    color: #0ff;
-    z-index: -1;
-    animation: glitch-anim-1 2s infinite linear alternate-reverse;
-  }
-  .glitch-text::after {
-    color: #f0f;
-    z-index: -2;
-    animation: glitch-anim-2 3s infinite linear alternate-reverse;
-  }
-
-  @keyframes glitch-anim-1 {
-    0% { clip: rect(20px, 9999px, 15px, 0); transform: translate(-2px, 2px); }
-    10% { clip: rect(40px, 9999px, 85px, 0); transform: translate(2px, -2px); }
-    20% { clip: rect(10px, 9999px, 55px, 0); transform: translate(-2px, 2px); }
-    30% { clip: rect(80px, 9999px, 25px, 0); transform: translate(2px, -2px); }
-    100% { clip: rect(30px, 9999px, 45px, 0); transform: translate(-2px, 2px); }
-  }
-  @keyframes glitch-anim-2 {
-    0% { clip: rect(10px, 9999px, 35px, 0); transform: translate(2px, -2px); }
-    10% { clip: rect(50px, 9999px, 15px, 0); transform: translate(-2px, 2px); }
-    20% { clip: rect(20px, 9999px, 65px, 0); transform: translate(2px, -2px); }
-    30% { clip: rect(90px, 9999px, 45px, 0); transform: translate(-2px, 2px); }
-    100% { clip: rect(40px, 9999px, 55px, 0); transform: translate(2px, -2px); }
-  }
-
-  /* Custom Sleek Scrollbars */
+  /* Elegantly thin, dark red/purple tinted scrollbars */
   .custom-scrollbar::-webkit-scrollbar {
     width: 6px;
     height: 6px;
@@ -451,9 +305,9 @@
     background: transparent;
   }
   .custom-scrollbar::-webkit-scrollbar-thumb {
-    @apply bg-indigo-500/30 rounded-full border border-black/20;
+    @apply bg-rose-500/20 rounded-full border border-black/20;
   }
   .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-    @apply bg-indigo-500/50;
+    @apply bg-rose-500/40;
   }
 }

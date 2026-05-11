@@ -1,48 +1,138 @@
-import type { IngestPayload, IngestResponse, GrievanceCase, GrievanceStatus, StatusResponse } from '@/types';
+import type { 
+  IngestPayload, 
+  IngestResponse, 
+  GrievanceCase, 
+  StatusResponse,
+  AdminUser,
+  AuditLog,
+  SystemSettings
+} from '@/types';
 
+// ============================================================================
+// CUSTOM ERROR CLASS
+// ============================================================================
+export class ApiError extends Error {
+  public status: number;
+  public data: any;
+
+  constructor(status: number, message: string, data?: any) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.data = data;
+  }
+}
+
+// ============================================================================
+// API CLIENT
+// ============================================================================
 class ApiClient {
-  public async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
-    // 🚨 ALL requests hit the Next.js internal proxy, NEVER FastAPI directly
-    const url = `/api${endpoint}`;
+  private defaultTimeout = 30000; // 30 seconds
 
-    const headers = new Headers(options.headers);
-    headers.set('Content-Type', 'application/json');
+  /**
+   * Resolves the base URL dynamically to support both Client-Side (CSR) 
+   * and Server-Side (SSR) rendering in Next.js.
+   */
+  private getBaseUrl(): string {
+    if (typeof window !== 'undefined') return ''; // Browser uses relative path
+    if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}`;
+    return process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000';
+  }
 
-    // 🚨 FIX 1: Attach Global Frontend Security Key
+  /**
+   * Centralized header constructor to ensure security tokens are 
+   * consistently applied across all requests safely.
+   */
+  private getHeaders(customHeaders?: HeadersInit): Headers {
+    const headers = new Headers(customHeaders);
+    if (!headers.has('Content-Type')) {
+      headers.set('Content-Type', 'application/json');
+    }
+
     if (process.env.NEXT_PUBLIC_FRONTEND_API_KEY) {
       headers.set('X-Frontend-API-Key', process.env.NEXT_PUBLIC_FRONTEND_API_KEY);
     }
 
-    // 🚨 FIX 2: Safely inject active sessions from LocalStorage (SSR-Safe)
     if (typeof window !== 'undefined') {
-      // Check for Citizen Session
-      const citizenSession = localStorage.getItem('civiclink_user_session');
-      if (citizenSession) {
-        try {
+      try {
+        const citizenSession = localStorage.getItem('civiclink_user_session');
+        if (citizenSession) {
           const parsed = JSON.parse(citizenSession);
-          if (parsed.sessionId) {
-            headers.set('X-Session-ID', parsed.sessionId);
-          }
-        } catch (e) {
-          console.warn("Failed to parse citizen session.");
+          if (parsed.sessionId) headers.set('X-Session-ID', parsed.sessionId);
         }
-      }
 
-      // Check for Admin JWT Token (For Mission Control)
-      const adminToken = localStorage.getItem('civiclink_admin_token');
-      if (adminToken) {
-        headers.set('Authorization', `Bearer ${adminToken}`);
+        const adminToken = localStorage.getItem('civiclink_admin_token');
+        if (adminToken) {
+          headers.set('Authorization', `Bearer ${adminToken}`);
+        }
+      } catch (e) {
+        console.error('Session parsing error:', e);
       }
     }
 
-    const response = await fetch(url, { ...options, headers });
+    return headers;
+  }
 
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}));
-      throw new Error(errorData.error || errorData.detail || `Request failed (${response.status})`);
+  /**
+   * Core request orchestrator with timeout protection and robust error parsing.
+   */
+  public async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+    const url = `${this.getBaseUrl()}/api${endpoint}`;
+    const headers = this.getHeaders(options.headers);
+    
+    // Setup Timeout Controller
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), this.defaultTimeout);
+
+    try {
+      const response = await fetch(url, { 
+        ...options, 
+        headers,
+        signal: controller.signal 
+      });
+
+      clearTimeout(timeoutId);
+
+      // Handle empty responses (e.g., 204 No Content)
+      if (response.status === 204) {
+        return {} as T;
+      }
+
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        let errorMessage = 'Request failed';
+        
+        // Parse FastAPI detailed validation arrays
+        if (typeof data.detail === 'string') {
+          errorMessage = data.detail;
+        } else if (Array.isArray(data.detail)) {
+          errorMessage = data.detail.map((err: any) => `${err.loc?.slice(-1)}: ${err.msg}`).join(' | ');
+        } else if (data.error) {
+          errorMessage = data.error;
+        } else {
+          errorMessage = `HTTP ${response.status}: ${response.statusText}`;
+        }
+
+        // Redirect to login if token is expired/invalid (Global 401 Interceptor)
+        if (response.status === 401 && typeof window !== 'undefined') {
+          if (endpoint.startsWith('/v1/admin')) {
+             localStorage.removeItem('civiclink_admin_token');
+             window.location.href = '/';
+          }
+        }
+
+        throw new ApiError(response.status, errorMessage, data);
+      }
+
+      return data as T;
+    } catch (error: any) {
+      clearTimeout(timeoutId);
+      if (error.name === 'AbortError') {
+        throw new ApiError(408, 'Network request timed out. Please check your connection.');
+      }
+      throw error;
     }
-
-    return response.json();
   }
 
   // ==========================================
@@ -59,89 +149,104 @@ class ApiClient {
   async getStatus(threadId: string): Promise<StatusResponse> {
     return this.request<StatusResponse>(`/v1/status/${threadId}`, { method: 'GET' });
   }
+  
+  async citizenLogin(username: string, passwordHash: string) {
+    return this.request('/v1/auth/citizen/login', {
+      method: 'POST',
+      body: JSON.stringify({ 
+        username: username, 
+        password: passwordHash // 🚨 REVERTED: FastAPI expects 'password' here!
+      }),
+    });
+  }
+
+  async citizenRegister(username: string, passwordHash: string, phone?: string) {
+    return this.request('/v1/auth/citizen/register', {
+      method: 'POST',
+      body: JSON.stringify({ 
+        username: username, 
+        password: passwordHash, // 🚨 REVERTED: FastAPI expects 'password' here!
+        phone_number: phone     // Keep this as phone_number
+      }),
+    });
+  }
 
   // ==========================================
   // ADMIN MISSION CONTROL METHODS
   // ==========================================
 
-  // 1. Fetch aggregate stats for the Recharts dashboard
   async fetchDashboardStats() {
     return this.request<any>('/v1/admin/stats', { method: 'GET' });
   }
 
-  // 2. Fetch the active queue for the main table
   async fetchReviewQueue() {
     return this.request<GrievanceCase[]>('/v1/admin/queue', { method: 'GET' });
   }
 
-  // 3. Fetch specific case details (including extracted metadata)
   async fetchGrievanceCase(threadId: string) {
     return this.request<GrievanceCase>(`/v1/admin/case/${threadId}`, { method: 'GET' });
   }
 
-  // 4. Fetch the raw LangGraph Checkpointer history for the visualizer
   async fetchGraphState(threadId: string) {
     return this.request<any>(`/v1/admin/graph-state/${threadId}`, { method: 'GET' });
   }
 
-  // 5. HITL Action: Approve and resume the graph
   async approveGrievance(threadId: string) {
-    return this.request(`/v1/admin/approve/${threadId}`, { method: 'POST' });
-  }
-
-  // 6. HITL Action: Reject and halt the graph
-  async rejectGrievance(threadId: string, reason: string) {
-    return this.request(`/v1/admin/reject/${threadId}`, {
+    return this.request(`/v1/admin/approve/${threadId}`, { 
       method: 'POST',
-      body: JSON.stringify({ reason })
+      body: JSON.stringify({ human_review_decision: "APPROVED" }) 
     });
   }
 
-  // 7. Fetch system health metrics
+  async rejectGrievance(threadId: string, reason: string) {
+    return this.request(`/v1/admin/reject/${threadId}`, {
+      method: 'POST',
+      body: JSON.stringify({ 
+        human_review_decision: "REJECTED",
+        rejection_reason: reason 
+      })
+    });
+  }
+
   async fetchSystemHealth() {
     return this.request<any>('/v1/admin/health', { method: 'GET' });
   }
 
-  // 8. Fetch only grievances awaiting HITL review
   async fetchPendingReviews() {
     return this.request<GrievanceCase[]>('/v1/admin/pending', { method: 'GET' });
   }
 
-  // 9. Retry a specific node in the LangGraph (for admins)
   async retryGraphNode(threadId: string, nodeId: string) {
-    return this.request(`/v1/admin/retry/${threadId}/${nodeId}`, { 
-      method: 'POST' 
+    return this.request(`/v1/admin/retry/${threadId}`, { 
+      method: 'POST',
+      body: JSON.stringify({ target_node: nodeId, retry_flag: true })
     });
   }
 
-    // 10. Fetch all messages in a grievance thread (for audit logs)
   async fetchCaseMessages(threadId: string) {
     return this.request<any[]>(`/v1/admin/messages/${threadId}`, { method: 'GET' });
   }
 
-  // 11. Fetch grievances with optional filters (for the grievances page)
   async fetchGrievances(params: any = {}) {
-    // Convert params object to URL Query String
     const searchParams = new URLSearchParams();
     Object.entries(params).forEach(([key, value]) => {
-      if (value !== undefined && value !== '') {
+      if (value !== undefined && value !== null && value !== '') {
         searchParams.append(key, String(value));
       }
     });
-    
     return this.request<{items: GrievanceCase[], total: number}>(`/v1/admin/grievances?${searchParams.toString()}`, { 
       method: 'GET' 
     });
   }
 
   // ==========================================
-  // USER MANAGEMENT METHODS
+  // USER & AUDIT MANAGEMENT
   // ==========================================
+  
   async fetchUsers() {
-    return this.request<any[]>('/v1/admin/users', { method: 'GET' });
+    return this.request<AdminUser[]>('/v1/admin/users', { method: 'GET' });
   }
 
-// 12. Create a new admin user
   async createUser(userData: any) {
     return this.request('/v1/admin/users', {
       method: 'POST',
@@ -149,39 +254,18 @@ class ApiClient {
     });
   }
 
-  // ==========================================
-  // AUDIT LOG METHODS
-  // ==========================================
   async fetchAuditLogs() {
-    return this.request<any[]>('/v1/admin/audit', { method: 'GET' });
+    return this.request<AuditLog[]>('/v1/admin/audit', { method: 'GET' });
   }
 
-  // ==========================================
-  // SYSTEM SETTINGS METHODS
-  // ==========================================
   async fetchSystemSettings() {
-    return this.request<any>('/v1/admin/settings', { method: 'GET' });
+    return this.request<SystemSettings>('/v1/admin/settings', { method: 'GET' });
   }
 
-  async updateSystemSettings(settings: any) {
+  async updateSystemSettings(settings: SystemSettings) {
     return this.request('/v1/admin/settings', {
       method: 'PUT',
       body: JSON.stringify(settings)
-    });
-  }
-
-  // Add inside the ApiClient class:
-  async citizenLogin(username: string, passwordHash: string) {
-    return this.request('/v1/auth/citizen/login', {
-      method: 'POST',
-      body: JSON.stringify({ username, passwordHash }),
-    });
-  }
-
-  async citizenRegister(username: string, passwordHash: string, phone?: string) {
-    return this.request('/v1/auth/citizen/register', {
-      method: 'POST',
-      body: JSON.stringify({ username, passwordHash, phone }),
     });
   }
 }

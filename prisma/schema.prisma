@@ -1,4 +1,3 @@
-// schema.prisma
 // CivicLink: Production-Ready "Fort Knox" Data Layer
 // Synchronizes LangGraph backend, Next.js dashboard, async worker queues, and cryptographic security.
 
@@ -12,7 +11,6 @@ generator py_client {
 generator js_client {
   provider        = "prisma-client-js"
   previewFeatures = ["postgresqlExtensions"]
-  // Adjust this output path if necessary based on where you run prisma generate
   output          = "../frontend/node_modules/.prisma/client"
 }
 
@@ -26,7 +24,6 @@ datasource db {
 // GLOBAL ENUMS: Strict Type Safety
 // ─────────────────────────────────────────────────────────────
 
-// 🚨 UPGRADED: Matched to frontend RBAC exactly
 enum AdminRole {
   SUPER_ADMIN
   ADMIN
@@ -35,7 +32,6 @@ enum AdminRole {
   SUPPORT
 }
 
-// 🚨 ADDED: For User Management Dashboard
 enum AdminStatus {
   ACTIVE
   INACTIVE
@@ -123,29 +119,29 @@ model WebhookEvent {
 // ─────────────────────────────────────────────────────────────
 
 model AdminUser {
-  id                      String      @id @default(cuid())
-  name                    String      // 🚨 ADDED
-  email                   String      @unique
-  passwordHash            String
+  id                    String      @id @default(cuid())
+  name                  String      
+  email                 String      @unique
+  passwordHash          String
   
   // Security Protocols
-  mfaEnabled              Boolean     @default(false)
-  mfaSecret               String?     // Encrypted TOTP Secret
-  failedLoginAttempts     Int         @default(0)
-  lastLoginAt             DateTime?
-  accountLockedUntil      DateTime?
+  mfaEnabled            Boolean     @default(false)
+  mfaSecret             String?     // Encrypted TOTP Secret
+  failedLoginAttempts   Int         @default(0)
+  lastLoginAt           DateTime?
+  accountLockedUntil    DateTime?
 
-  role                    AdminRole   @default(REVIEWER) // 🚨 UPGRADED
-  status                  AdminStatus @default(ACTIVE)   // 🚨 ADDED
-  jurisdictionAccessState String?  
-  actionsCount            Int         @default(0)        // 🚨 ADDED
-  createdAt               DateTime    @default(now())
+  role                  AdminRole   @default(REVIEWER) 
+  status                AdminStatus @default(ACTIVE)   
+  jurisdictionAccessState String?   
+  actionsCount          Int         @default(0)        
+  createdAt             DateTime    @default(now())
 
   // Relations
-  reviewedGrievances      GrievanceCase[]
-  overriddenContacts      AdministrativeHierarchy[]
-  auditLogs               SystemAuditLog[]               // 🚨 UPGRADED
-  sessions                AdminSession[]
+  reviewedGrievances    GrievanceCase[]
+  overriddenContacts    AdministrativeHierarchy[]
+  auditLogs             SystemAuditLog[]               
+  sessions              AdminSession[]
   
   @@map("admin_users")
 }
@@ -170,7 +166,6 @@ model AdminSession {
   @@map("admin_sessions")
 }
 
-// 🚨 UPGRADED: Replacing SecurityAuditLog with SystemAuditLog to support the frontend Audit page
 model SystemAuditLog {
   id            String   @id @default(cuid())
   timestamp     DateTime @default(now())
@@ -192,7 +187,6 @@ model SystemAuditLog {
   @@map("system_audit_logs")
 }
 
-// 🚨 ADDED: Global System Settings Cache
 model SystemSetting {
   id        String   @id @default("global") // Enforce single row
   config    Json     // Contains { system: {}, ai: {}, features: {}, security: {} }
@@ -202,16 +196,13 @@ model SystemSetting {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 3. CITIZEN CRYPTOGRAPHY & ANONYMIZATION
-// ─────────────────────────────────────────────────────────────
-// ─────────────────────────────────────────────────────────────
 // 3. CITIZEN CRYPTOGRAPHY & WEB AUTHENTICATION
 // ─────────────────────────────────────────────────────────────
 
 model Citizen {
   id               String         @id @default(cuid())
   
-  // 🚨 ADDED: Web Portal Credentials (Nullable for WhatsApp-only users)
+  // Web Portal Credentials (Nullable for WhatsApp-only users)
   username         String?        @unique 
   passwordHash     String?
   lastWebLoginAt   DateTime?
@@ -240,13 +231,12 @@ model Citizen {
   locations        UserLocation[]
   threads          GrievanceThread[]
   grievances       GrievanceCase[]
-  sessions         CitizenSession[] // 🚨 ADDED: Tracks web portal logins
+  sessions         CitizenSession[] 
 
   @@index([trustScore])
   @@map("citizens")
 }
 
-// 🚨 ADDED: Secure Session Management for Citizens
 model CitizenSession {
   id               String    @id @default(cuid())
   citizenId        String
@@ -284,7 +274,8 @@ model UserLocation {
   isDefault        Boolean  @default(false)
   createdAt        DateTime @default(now())
 
-  citizen          Citizen  @relation(fields: [citizenId], references: [id], onDelete: Cascade)
+  // 🚨 Restrict deletion to prevent cascading structural failure
+  citizen          Citizen  @relation(fields: [citizenId], references: [id], onDelete: Restrict)
   grievances       GrievanceCase[]
 
   @@map("user_locations")
@@ -327,11 +318,11 @@ model AdministrativeHierarchy {
   
   // Escalation Tree (Self-Referencing)
   escalationContactId   String?            
-  escalationContact     AdministrativeHierarchy?  @relation("EscalationTree", fields: [escalationContactId], references: [id])
+  // 🚨 ADDED: onDelete: SetNull prevents a deleted parent from nuking its children
+  escalationContact     AdministrativeHierarchy?  @relation("EscalationTree", fields: [escalationContactId], references: [id], onDelete: SetNull)
   escalatedFrom         AdministrativeHierarchy[] @relation("EscalationTree")
 
   overriddenById        String?            
-  // 🚨 SetNull ensures cache isn't destroyed if a moderator is deleted
   overriddenBy          AdminUser?         @relation(fields: [overriddenById], references: [id], onDelete: SetNull)
   
   dispatchedGrievances  GrievanceCase[]
@@ -359,6 +350,7 @@ model GrievanceThread {
   createdAt        DateTime        @default(now())
   updatedAt        DateTime        @updatedAt @db.Timestamptz
 
+  // 🚨 Restrict deletion so historical threads survive citizen anonymization
   citizen          Citizen         @relation(fields: [citizenId], references: [id], onDelete: Restrict)
   case             GrievanceCase?
   auditEvents      AuditEvent[]
@@ -395,11 +387,11 @@ model GrievanceCase {
   createdAt            DateTime        @default(now())
   updatedAt            DateTime        @updatedAt @db.Timestamptz
 
-  // 🚨 Defensive Relations (SetNull to prevent historical deletion crashes)
   reviewedBy           AdminUser?      @relation(fields: [reviewedById], references: [id], onDelete: SetNull)
   dispatchedTo         AdministrativeHierarchy? @relation(fields: [dispatchedToId], references: [id], onDelete: SetNull)
   
-  citizen              Citizen         @relation(fields: [citizenId], references: [id], onDelete: Cascade)
+  // 🚨 Prevent accidental ledger annihilation
+  citizen              Citizen         @relation(fields: [citizenId], references: [id], onDelete: Restrict)
   thread               GrievanceThread @relation(fields: [threadId], references: [threadId], onDelete: Cascade)
   location             UserLocation?   @relation(fields: [locationId], references: [id], onDelete: SetNull)
   
@@ -506,19 +498,21 @@ model AuditEvent {
 // ─────────────────────────────────────────────────────────────
 model LegalCitation {
   id                   String   @id @default(cuid())
-  actName              String   @db.VarChar(200)  // e.g., "West Bengal Municipal Act, 1993"
-  section              String   @db.VarChar(50)   // e.g., "Section 215"
-  description          String   @db.Text          // Plain English explanation
-  penalty              String?  @db.Text          // Consequences of non-compliance
-  enforcingAuthority   String   @db.VarChar(100)  // e.g., "Municipal Commissioner"
+  
+  // 🚨 REMOVED: @db.VarChar limitations. Using optimized Postgres TEXT automatically.
+  actName              String   
+  section              String   
+  description          String   @db.Text // Plain English explanation
+  penalty              String?  @db.Text // Consequences of non-compliance
+  enforcingAuthority   String   
   
   // Jurisdiction scope
-  state                String?  @db.VarChar(100)
-  district             String?  @db.VarChar(100)
+  state                String?  
+  district             String?  
   applicableNationwide Boolean  @default(false)
   
   // Issue category mapping (for RAG retrieval)
-  issueCategory        String   @db.VarChar(50)   // e.g., "garbage", "pothole"
+  issueCategory        String   // e.g., "garbage", "pothole"
   
   // pgvector embedding for semantic search (384-dim)
   embedding            Unsupported("vector(384)")?

@@ -1,4 +1,3 @@
-// app/(admin)/components/StatusBadge.tsx
 'use client';
 
 import { motion } from 'framer-motion';
@@ -18,102 +17,115 @@ export function StatusBadge({
   showPulse = true,
   className,
 }: StatusBadgeProps) {
-  // 🚨 FIXED: Full class strings mapped to prevent Tailwind PurgeCSS from stripping colors in production
+  // 🚨 STRICT SEMANTIC PALETTE: Slate (Idle), Purple (AI Processing), Amber (HITL), Emerald (Success), Rose (Fail)
   const config: Record<GrievanceStatus, { 
     classes: string; 
     dotClass: string;
     label: string;
     pulseColor: string;
+    isPulsing: boolean; // Only pulse when actively processing or waiting
   }> = {
     RECEIVED: { 
-      classes: 'bg-blue-500/10 border-blue-500/30 text-blue-300', 
-      dotClass: 'bg-blue-400',
+      classes: 'bg-slate-500/10 border-slate-500/20 text-slate-300', 
+      dotClass: 'bg-slate-400',
       label: 'Received',
-      pulseColor: 'rgba(56, 189, 248, 0.4)'
+      pulseColor: 'rgba(148, 163, 184, 0.4)',
+      isPulsing: false
     },
     VERIFYING_IMAGE: { 
-      classes: 'bg-yellow-500/10 border-yellow-500/30 text-yellow-300', 
-      dotClass: 'bg-yellow-400',
-      label: 'Verifying',
-      pulseColor: 'rgba(245, 158, 11, 0.4)'
+      classes: 'bg-purple-500/10 border-purple-500/30 text-purple-300', 
+      dotClass: 'bg-purple-400',
+      label: 'Verifying Vision',
+      pulseColor: 'rgba(147, 51, 234, 0.4)',
+      isPulsing: true
     },
     ROUTING_JURISDICTION: { 
       classes: 'bg-purple-500/10 border-purple-500/30 text-purple-300', 
       dotClass: 'bg-purple-400',
       label: 'Routing',
-      pulseColor: 'rgba(139, 92, 246, 0.4)'
+      pulseColor: 'rgba(147, 51, 234, 0.4)',
+      isPulsing: true
     },
     DISCOVERING_CONTACT: { 
-      classes: 'bg-indigo-500/10 border-indigo-500/30 text-indigo-300', 
-      dotClass: 'bg-indigo-400',
-      label: 'Finding Contact',
-      pulseColor: 'rgba(99, 102, 241, 0.4)'
+      classes: 'bg-purple-500/10 border-purple-500/30 text-purple-300', 
+      dotClass: 'bg-purple-400',
+      label: 'OSINT Search',
+      pulseColor: 'rgba(147, 51, 234, 0.4)',
+      isPulsing: true
     },
     DRAFTING_LETTER: { 
-      classes: 'bg-pink-500/10 border-pink-500/30 text-pink-300', 
-      dotClass: 'bg-pink-400',
-      label: 'Drafting',
-      pulseColor: 'rgba(236, 72, 153, 0.4)'
+      classes: 'bg-purple-500/10 border-purple-500/30 text-purple-300', 
+      dotClass: 'bg-purple-400',
+      label: 'Drafting Legal',
+      pulseColor: 'rgba(147, 51, 234, 0.4)',
+      isPulsing: true
     },
     AWAITING_REVIEW: { 
-      classes: 'bg-orange-500/10 border-orange-500/30 text-orange-300', 
-      dotClass: 'bg-orange-400',
-      label: 'Awaiting Review',
-      pulseColor: 'rgba(249, 115, 22, 0.4)'
+      classes: 'bg-amber-500/10 border-amber-500/30 text-amber-400', 
+      dotClass: 'bg-amber-400',
+      label: 'Awaiting Auth',
+      pulseColor: 'rgba(245, 158, 11, 0.5)',
+      isPulsing: true // Human attention needed
     },
     DISPATCHING: { 
-      classes: 'bg-cyan-500/10 border-cyan-500/30 text-cyan-300', 
-      dotClass: 'bg-cyan-400',
+      classes: 'bg-purple-500/10 border-purple-500/30 text-purple-300', 
+      dotClass: 'bg-purple-400',
       label: 'Dispatching',
-      pulseColor: 'rgba(6, 182, 212, 0.4)'
+      pulseColor: 'rgba(147, 51, 234, 0.4)',
+      isPulsing: true
     },
     DISPATCHED: { 
-      classes: 'bg-green-500/10 border-green-500/30 text-green-300', 
-      dotClass: 'bg-green-400',
+      classes: 'bg-emerald-500/10 border-emerald-500/20 text-emerald-400', 
+      dotClass: 'bg-emerald-400',
       label: 'Dispatched',
-      pulseColor: 'rgba(34, 197, 94, 0.4)'
+      pulseColor: 'rgba(16, 185, 129, 0)',
+      isPulsing: false
     },
     FAILED: { 
-      classes: 'bg-red-500/10 border-red-500/30 text-red-300', 
-      dotClass: 'bg-red-400',
-      label: 'Failed',
-      pulseColor: 'rgba(239, 68, 68, 0.4)'
+      classes: 'bg-rose-500/10 border-rose-500/30 text-rose-400', 
+      dotClass: 'bg-rose-400',
+      label: 'Sys Failure',
+      pulseColor: 'rgba(225, 29, 72, 0)',
+      isPulsing: false
     },
     RESOLVED: { 
-      classes: 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300', 
+      classes: 'bg-emerald-500/10 border-emerald-500/20 text-emerald-400', 
       dotClass: 'bg-emerald-400',
       label: 'Resolved',
-      pulseColor: 'rgba(16, 185, 129, 0.4)'
+      pulseColor: 'rgba(16, 185, 129, 0)',
+      isPulsing: false
     },
     REJECTED_FRAUD: { 
-      classes: 'bg-rose-500/10 border-rose-500/30 text-rose-300', 
+      classes: 'bg-rose-500/10 border-rose-500/30 text-rose-400', 
       dotClass: 'bg-rose-400',
-      label: 'Rejected',
-      pulseColor: 'rgba(244, 63, 94, 0.4)'
+      label: 'Halted',
+      pulseColor: 'rgba(225, 29, 72, 0)',
+      isPulsing: false
     },
     ESCALATED: { 
-      classes: 'bg-violet-500/10 border-violet-500/30 text-violet-300', 
-      dotClass: 'bg-violet-400',
+      classes: 'bg-orange-500/10 border-orange-500/30 text-orange-400', 
+      dotClass: 'bg-orange-400',
       label: 'Escalated',
-      pulseColor: 'rgba(124, 58, 237, 0.4)'
+      pulseColor: 'rgba(249, 115, 22, 0.4)',
+      isPulsing: true
     },
   };
   
-  const { classes, dotClass, label, pulseColor } = config[status] || config.RECEIVED;
+  const { classes, dotClass, label, pulseColor, isPulsing } = config[status] || config.RECEIVED;
   
   const sizeClasses = {
-    sm: 'px-2 py-0.5 text-xs',
-    md: 'px-2.5 py-1 text-xs',
-    lg: 'px-3 py-1.5 text-sm',
+    sm: 'px-2 py-0.5 text-[9px]',
+    md: 'px-2.5 py-1 text-[10px]',
+    lg: 'px-3 py-1.5 text-xs',
   };
   
   return (
     <motion.span
-      initial={{ opacity: 0, scale: 0.9 }}
+      initial={{ opacity: 0, scale: 0.95 }}
       animate={{ opacity: 1, scale: 1 }}
-      transition={{ type: 'spring', stiffness: 500, damping: 30 }}
+      transition={{ type: 'spring', stiffness: 400, damping: 25 }}
       className={cn(
-        'inline-flex items-center gap-1.5 rounded-full font-medium border backdrop-blur-sm',
+        'inline-flex items-center gap-1.5 rounded-md font-bold uppercase tracking-widest border backdrop-blur-md',
         classes,
         sizeClasses[size],
         className
@@ -121,19 +133,19 @@ export function StatusBadge({
     >
       {showPulse && (
         <motion.span
-          className={cn('w-1.5 h-1.5 rounded-full', dotClass)}
-          animate={{
+          className={cn('rounded-full', dotClass, size === 'sm' ? 'w-1 h-1' : 'w-1.5 h-1.5')}
+          animate={isPulsing ? {
             boxShadow: [
               `0 0 0 0 ${pulseColor}`,
-              `0 0 0 8px transparent`,
+              `0 0 0 ${size === 'sm' ? '4px' : '6px'} transparent`,
               `0 0 0 0 transparent`,
             ],
-          }}
-          transition={{
+          } : {}}
+          transition={isPulsing ? {
             duration: 2,
             repeat: Infinity,
             ease: 'easeInOut',
-          }}
+          } : {}}
         />
       )}
       {label}

@@ -11,6 +11,7 @@ ARCHITECTURAL PRINCIPLES:
 - JSON Safety: All Dict/List values must contain only JSON-serializable primitives (str, int, float, bool, None).
 """
 
+from operator import add
 from typing import TypedDict, List, Dict, Optional, Literal, Any, Annotated
 
 # --- CUSTOM SAFE REDUCER ---
@@ -96,5 +97,11 @@ class CivicLinkState(TypedDict, total=False):
     # ---------------------------------------------------------
     # These logs sync directly to the 'audit_events' table via db_sync.py
     error_log: Annotated[List[Dict[str, Any]], reduce_list]
-    status_updates: Annotated[List[Dict[str, Any]], reduce_list]
     # Example entry: {"node": "ingest", "action": "payload_sanitized", "ts": "2024-01-01T12:00:00Z", "details": {...}}
+
+    # The Retry Counter: Tracks how many times the Seeder has hallucinated new targets
+    seeder_retry_count: int 
+    
+    # The Audit Trail: We use Annotated with 'add' so each node appends to the list
+    # instead of overwriting it. This gives a perfect timeline of events.
+    status_updates: Annotated[List[Dict[str, Any]], add]

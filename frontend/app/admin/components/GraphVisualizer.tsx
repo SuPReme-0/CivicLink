@@ -1,4 +1,3 @@
-// app/(admin)/components/GraphVisualizer.tsx
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
@@ -7,20 +6,47 @@ import { useQuery } from '@tanstack/react-query';
 import { 
   Play, Pause, RotateCcw, Check, X, AlertCircle, ChevronDown, 
   ChevronRight, Copy, ExternalLink, RefreshCw, ShieldCheck,
-  MessageSquare, MapPin, Image as ImageIcon, FileText, Send,
-  Maximize2, Minimize2, Mail, Loader2
+  Terminal, Network, Zap, Maximize2, Minimize2, Loader2
 } from 'lucide-react';
 import { toast } from 'react-hot-toast';
 
-import { apiClient } from '@/lib/api-client';
 import { cn, formatRelativeTime } from '@/lib/utils';
 import { useRealTime } from '../layout';
+
+// =============================================================================
+// 🚨 SECURE ADMIN API WRAPPERS (Vercel Ready)
+// =============================================================================
+const getBaseUrl = () => {
+  const url = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
+  return url.replace('localhost', '127.0.0.1'); 
+};
+
+const secureAdminFetch = async (endpoint: string) => {
+  const res = await fetch(`${getBaseUrl()}/api/v1/admin/${endpoint}`, {
+    headers: { 'Authorization': `Bearer ${process.env.NEXT_PUBLIC_FRONTEND_API_KEY || 'civiclink_dev_super_secret_998877'}` },
+    cache: 'no-store'
+  });
+  if (!res.ok) throw new Error(`Fetch failed: ${res.statusText}`);
+  return res.json();
+};
+
+const secureAdminAction = async (endpoint: string, method: string = 'POST') => {
+  const res = await fetch(`${getBaseUrl()}/api/v1/admin/${endpoint}`, {
+    method,
+    headers: { 
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${process.env.NEXT_PUBLIC_FRONTEND_API_KEY || 'civiclink_dev_super_secret_998877'}` 
+    }
+  });
+  if (!res.ok) throw new Error(`Action failed: ${res.statusText}`);
+  return res.json();
+};
 
 // =============================================================================
 // TYPES
 // =============================================================================
 
-type GraphNode = {
+export type GraphNode = {
   id: string;
   name: string;
   status: 'pending' | 'running' | 'success' | 'error' | 'skipped';
@@ -39,12 +65,6 @@ type GraphNode = {
   };
 };
 
-type GraphEdge = {
-  source: string;
-  target: string;
-  status: 'active' | 'completed' | 'failed';
-};
-
 // =============================================================================
 // NODE VISUAL COMPONENT
 // =============================================================================
@@ -61,11 +81,11 @@ function GraphNodeVisual({
   onRetry?: () => void;
 }) {
   const statusColors: Record<GraphNode['status'], string> = {
-    pending: 'border-white/20 bg-white/5',
-    running: 'border-blue-500/50 bg-blue-500/10 animate-pulse',
-    success: 'border-green-500/50 bg-green-500/10',
-    error: 'border-red-500/50 bg-red-500/10',
-    skipped: 'border-white/10 bg-white/5 opacity-60',
+    pending: 'border-white/[0.05] bg-white/[0.01]',
+    running: 'border-purple-500/40 bg-purple-500/10 shadow-[0_0_15px_rgba(147,51,234,0.15)]',
+    success: 'border-emerald-500/20 bg-emerald-500/[0.05]',
+    error: 'border-rose-500/40 bg-rose-500/10 shadow-[0_0_15px_rgba(225,29,72,0.1)]',
+    skipped: 'border-white/[0.02] bg-white/[0.01] opacity-50',
   };
   
   const statusIcons: Record<GraphNode['status'], React.ElementType> = {
@@ -80,137 +100,117 @@ function GraphNodeVisual({
   
   return (
     <div className={cn(
-      'glass-panel rounded-xl border overflow-hidden transition-all',
-      statusColors[node.status]
+      'rounded-xl border overflow-hidden transition-all duration-500 backdrop-blur-md',
+      statusColors[node.status],
+      isExpanded && 'bg-black/40'
     )}>
-      {/* Node header */}
+      {/* --- NODE HEADER --- */}
       <button
         onClick={onToggle}
-        className="w-full flex items-center gap-3 p-4 text-left hover:bg-white/5 transition-colors"
+        className="w-full flex items-center gap-4 p-4 text-left hover:bg-white/[0.02] transition-colors"
       >
         <div className={cn(
-          'p-2 rounded-lg',
-          node.status === 'success' ? 'bg-green-500/20 text-green-400' :
-          node.status === 'error' ? 'bg-red-500/20 text-red-400' :
-          node.status === 'running' ? 'bg-blue-500/20 text-blue-400 animate-pulse' :
-          'bg-white/10 text-white/60'
+          'p-2.5 rounded-lg border flex-shrink-0 transition-all duration-300',
+          node.status === 'success' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' :
+          node.status === 'error' ? 'bg-rose-500/20 text-rose-400 border-rose-500/30' :
+          node.status === 'running' ? 'bg-purple-500/20 text-purple-400 animate-spin border-purple-500/30' :
+          'bg-white/5 text-slate-500 border-white/5'
         )}>
           <Icon className="w-4 h-4" />
         </div>
         
         <div className="flex-1 min-w-0">
-          <p className="font-medium text-sm truncate">{node.name}</p>
-          <p className="text-xs text-white/60 mt-0.5">
-            {node.startTime ? formatRelativeTime(node.startTime) : 'Pending'}
-            {node.duration && ` • ${node.duration}ms`}
+          <p className="font-bold text-sm text-slate-200 tracking-wide truncate">
+            {node.name}
+          </p>
+          <p className="text-[10px] font-mono tracking-widest uppercase text-slate-500 mt-1">
+            {node.startTime ? formatRelativeTime(node.startTime) : 'Awaiting Execution'}
+            {node.duration && <span className="text-purple-400/70 ml-2">[{node.duration}ms]</span>}
           </p>
         </div>
         
         {node.confidence !== undefined && (
           <div className="text-right hidden sm:block">
-            <p className="text-sm font-mono font-bold text-[var(--primary)]">
-              {(node.confidence * 100).toFixed(0)}%
+            <p className="text-lg font-black font-mono tracking-tighter text-emerald-400 drop-shadow-sm">
+              {(node.confidence * 100).toFixed(0)}<span className="text-xs opacity-50">%</span>
             </p>
-            <p className="text-xs text-white/60">confidence</p>
+            <p className="text-[9px] uppercase tracking-widest font-bold text-slate-600">CONFIDENCE</p>
           </div>
         )}
         
         <ChevronDown className={cn(
-          'w-4 h-4 text-white/40 transition-transform',
-          isExpanded && 'rotate-180'
+          'w-4 h-4 text-slate-500 transition-transform duration-300 ml-2',
+          isExpanded && 'rotate-180 text-purple-400'
         )} />
       </button>
       
-      {/* Node details (expandable) */}
+      {/* --- NODE DETAILS (Expanded) --- */}
       <AnimatePresence>
         {isExpanded && (
           <motion.div
             initial={{ opacity: 0, height: 0 }}
             animate={{ opacity: 1, height: 'auto' }}
             exit={{ opacity: 0, height: 0 }}
-            className="border-t border-white/10"
+            className="border-t border-white/[0.05]"
           >
-            <div className="p-4 space-y-4">
-              {/* Input/Output */}
-              {node.input && (
-                <div>
-                  <p className="text-xs font-medium text-white/60 mb-2">Input</p>
-                  <pre className="text-xs bg-black/30 rounded-lg p-3 overflow-x-auto max-h-32">
-                    {JSON.stringify(node.input, null, 2).slice(0, 500)}
-                    {JSON.stringify(node.input).length > 500 && '...'}
-                  </pre>
-                </div>
-              )}
+            <div className="p-5 space-y-5 bg-black/20">
               
-              {node.output && (
-                <div>
-                  <p className="text-xs font-medium text-white/60 mb-2">Output</p>
-                  <pre className="text-xs bg-black/30 rounded-lg p-3 overflow-x-auto max-h-32">
-                    {JSON.stringify(node.output, null, 2).slice(0, 500)}
-                    {JSON.stringify(node.output).length > 500 && '...'}
-                  </pre>
-                </div>
-              )}
-              
-              {/* Metadata cards */}
-              {node.metadata && (
-                <div className="space-y-2">
-                  {node.metadata.authScore !== undefined && (
-                    <div className="glass-panel rounded-lg p-3">
-                      <div className="flex items-center gap-2 mb-1">
-                        <ShieldCheck className="w-4 h-4 text-green-400" />
-                        <span className="text-xs font-medium">Verification Result</span>
-                      </div>
-                      <div className="flex items-center justify-between">
-                        <span className="text-sm">Authenticity Score</span>
-                        <span className="font-mono font-bold text-[var(--primary)]">
-                          {(node.metadata.authScore * 100).toFixed(0)}%
-                        </span>
-                      </div>
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                {node.input && (
+                  <div>
+                    <p className="text-[10px] font-bold uppercase tracking-widest text-slate-500 mb-2 flex items-center gap-1.5">
+                      <Terminal className="w-3 h-3 text-slate-400" /> Ingestion Payload
+                    </p>
+                    <div className="bg-[#050208] border border-white/[0.05] rounded-xl p-3 overflow-x-auto max-h-40 thin-scrollbar">
+                      <pre className="text-[10px] font-mono text-slate-400 leading-relaxed">
+                        {JSON.stringify(node.input, null, 2).slice(0, 800)}
+                        {JSON.stringify(node.input).length > 800 && '\n\n... [TRUNCATED]'}
+                      </pre>
                     </div>
-                  )}
-                  
-                  {node.metadata.officialEmail && (
-                    <div className="glass-panel rounded-lg p-3 border border-green-500/30 bg-green-500/5">
-                      <div className="flex items-center gap-2 mb-1">
-                        <Mail className="w-4 h-4 text-green-400" />
-                        <span className="text-xs font-medium text-green-300">Dispatched To</span>
-                      </div>
-                      <p className="text-sm font-mono text-green-300 break-all">
-                        {node.metadata.officialEmail}
-                      </p>
+                  </div>
+                )}
+                
+                {node.output && (
+                  <div>
+                    <p className="text-[10px] font-bold uppercase tracking-widest text-slate-500 mb-2 flex items-center gap-1.5">
+                      <Network className="w-3 h-3 text-purple-400" /> Emitted Tensor
+                    </p>
+                    <div className="bg-[#050208] border border-purple-500/20 rounded-xl p-3 overflow-x-auto max-h-40 thin-scrollbar">
+                      <pre className="text-[10px] font-mono text-emerald-400/80 leading-relaxed">
+                        {JSON.stringify(node.output, null, 2).slice(0, 800)}
+                        {JSON.stringify(node.output).length > 800 && '\n\n... [TRUNCATED]'}
+                      </pre>
                     </div>
-                  )}
-                </div>
-              )}
+                  </div>
+                )}
+              </div>
               
-              {/* Error details */}
               {node.error && (
-                <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-lg">
-                  <p className="text-sm font-medium text-red-300 mb-1">Error</p>
-                  <p className="text-xs text-red-200/80">{node.error}</p>
+                <div className="p-4 bg-rose-500/10 border border-rose-500/30 rounded-xl flex items-start gap-3">
+                  <AlertCircle className="w-5 h-5 text-rose-400 flex-shrink-0 mt-0.5" />
+                  <div>
+                    <p className="text-[10px] uppercase tracking-widest font-bold text-rose-400 mb-1">Execution Failure</p>
+                    <p className="text-xs text-rose-200/80 font-mono leading-relaxed">{node.error}</p>
+                  </div>
                 </div>
               )}
               
-              {/* Actions */}
-              <div className="flex items-center gap-2 pt-2 border-t border-white/10">
-                <button className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium bg-white/10 hover:bg-white/20 rounded-lg transition-colors">
-                  <Copy className="w-3 h-3" />
-                  Copy Output
+              <div className="flex items-center gap-3 pt-3">
+                <button 
+                  onClick={() => {
+                    navigator.clipboard.writeText(JSON.stringify(node, null, 2));
+                    toast.success('Log Copied');
+                  }}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold text-slate-400 hover:text-white bg-white/[0.02] border border-white/[0.05] hover:bg-white/[0.05] rounded-lg transition-colors"
+                >
+                  <Copy className="w-3 h-3" /> Copy Log
                 </button>
                 {node.status === 'error' && onRetry && (
                   <button 
                     onClick={onRetry}
-                    className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium bg-blue-500/20 text-blue-300 hover:bg-blue-500/30 rounded-lg transition-colors"
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold text-rose-300 bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 rounded-lg transition-colors"
                   >
-                    <RotateCcw className="w-3 h-3" />
-                    Retry Node
-                  </button>
-                )}
-                {node.output && (
-                  <button className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium bg-white/10 hover:bg-white/20 rounded-lg transition-colors ml-auto">
-                    <ExternalLink className="w-3 h-3" />
-                    View Details
+                    <RotateCcw className="w-3 h-3" /> Force Retry
                   </button>
                 )}
               </div>
@@ -241,100 +241,28 @@ export function GraphVisualizer({
   
   const { subscribe } = useRealTime();
   
-  // Fetch graph state
+  // 🚨 FIXED: Now hits the real LangGraph state via secureAdminFetch
   const { data: graphState, isLoading, refetch } = useQuery({
     queryKey: ['admin', 'graph', threadId],
-    queryFn: () => apiClient.fetchGraphState(threadId),
-    enabled: !!threadId && !isPreview
+    queryFn: () => secureAdminFetch(`graph-state/${threadId}`),
+    enabled: !!threadId && !isPreview,
+    refetchInterval: 3000 // Fast polling to watch AI process in real-time
   });
   
-  // Real-time subscription
   useEffect(() => {
     if (!threadId || isPreview) return;
     
     const unsubscribe = subscribe(threadId, (update) => {
-      // Optimistic update: refetch graph state
       refetch();
-      
-      // Show toast for important updates
       if (update.type === 'node_completed' && update.node === 'verification_gate') {
-        toast('Case ready for review', { icon: 'ℹ️' });
+        toast.success('Authorization Required: Thread pending review.', {
+          style: { background: 'rgba(20,10,30,0.9)', color: '#9333ea', border: '1px solid rgba(147,51,234,0.3)' }
+        });
       }
     });
     
     return unsubscribe;
   }, [threadId, subscribe, refetch, isPreview]);
-  
-  // Mock data for preview mode
-  const mockNodes: GraphNode[] = isPreview ? [
-    {
-      id: 'ingest',
-      name: 'Ingest & Sanitize',
-      status: 'success',
-      startTime: new Date(Date.now() - 30000).toISOString(),
-      endTime: new Date(Date.now() - 28000).toISOString(),
-      duration: 2000,
-      input: { text: 'Garbage not collected...', image_url: '...' },
-      output: { extracted_text: 'Garbage not collected...', language: 'en' },
-      confidence: 0.99,
-    },
-    {
-      id: 'vlm_verify',
-      name: 'VLM Image Verification',
-      status: 'success',
-      startTime: new Date(Date.now() - 28000).toISOString(),
-      endTime: new Date(Date.now() - 24000).toISOString(),
-      duration: 4000,
-      input: { image_url: '...', context: 'Garbage complaint' },
-      output: { is_genuine: true, confidence_score: 0.94, severity: 'MEDIUM' },
-      confidence: 0.94,
-      metadata: { authScore: 0.94 }
-    },
-    {
-      id: 'resolve_jurisdiction',
-      name: 'Jurisdiction Resolution',
-      status: 'success',
-      startTime: new Date(Date.now() - 24000).toISOString(),
-      endTime: new Date(Date.now() - 22000).toISOString(),
-      duration: 2000,
-      input: { text: '...', location: { lat: 22.57, lon: 88.41 } },
-      output: { district: 'North 24 Parganas', ward: '45' },
-      confidence: 0.92,
-      metadata: { jurisdiction: { district: 'North 24 Parganas', ward: '45' } }
-    },
-    {
-      id: 'discover_contact',
-      name: 'Contact Discovery',
-      status: 'success',
-      startTime: new Date(Date.now() - 22000).toISOString(),
-      endTime: new Date(Date.now() - 18000).toISOString(),
-      duration: 4000,
-      input: { jurisdiction: { ward: "45" } },
-      output: { officialEmail: 'cmoh-n24p@wbhealth.gov.in', verification: 'VERIFIED' },
-      confidence: 0.98,
-      metadata: { officialEmail: 'cmoh-n24p@wbhealth.gov.in' }
-    },
-    {
-      id: 'draft_letter',
-      name: 'Legal Draft Generation',
-      status: 'success',
-      startTime: new Date(Date.now() - 18000).toISOString(),
-      endTime: new Date(Date.now() - 15000).toISOString(),
-      duration: 3000,
-      input: { issue: 'sanitation', jurisdiction: { ward: "45" } },
-      output: { subject: 'Grievance: Waste Collection...', body: '...' },
-      confidence: 0.96,
-      metadata: { draftedContent: 'Formal complaint drafted...' }
-    },
-    {
-      id: 'verification_gate',
-      name: 'Verification Gatekeeper',
-      status: 'running',
-      startTime: new Date(Date.now() - 15000).toISOString(),
-      input: { auth_score: 0.94, severity: 'MEDIUM' },
-      confidence: undefined,
-    },
-  ] : (graphState?.nodes || []);
   
   const toggleNode = (nodeId: string) => {
     setExpandedNodes(prev => {
@@ -348,59 +276,58 @@ export function GraphVisualizer({
     });
   };
   
+  // 🚨 FIXED: Now hits the secure retry endpoint
   const handleRetry = async (node: GraphNode) => {
     try {
-      await apiClient.retryGraphNode(threadId, node.id);
-      toast.success(`Retrying ${node.name}`);
+      await secureAdminAction(`retry/${threadId}/${node.id}`);
+      toast.success(`Directive accepted. Retrying ${node.name}.`);
       refetch();
     } catch (error) {
       toast.error(`Retry failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   };
+
+  // 🚨 REMOVED ALL MOCK DATA! It strictly uses the live backend response now.
+  const activeNodes: GraphNode[] = graphState?.nodes || [];
   
   if (isLoading && !isPreview) {
     return (
-      <div className="flex items-center justify-center h-full">
-        <Loader2 className="w-8 h-8 animate-spin text-[var(--admin-accent)]" />
+      <div className="flex items-center justify-center h-full min-h-[300px]">
+        <div className="flex flex-col items-center gap-3">
+          <Loader2 className="w-8 h-8 animate-spin text-purple-500" />
+          <p className="text-[10px] uppercase tracking-widest text-slate-500 font-bold">Querying Graph State...</p>
+        </div>
       </div>
     );
   }
   
   return (
-    <div className="h-full flex flex-col">
-      {/* Header */}
-      <div className="flex items-center justify-between mb-4 pb-4 border-b border-white/10">
-        <div className="flex items-center gap-4">
-          <h3 className="text-lg font-semibold">Workflow Execution</h3>
-          <div className="flex items-center gap-2 text-xs text-white/60">
-            <span className="flex items-center gap-1">
-              <span className="w-2 h-2 rounded-full bg-green-400" /> Success
-            </span>
-            <span className="flex items-center gap-1">
-              <span className="w-2 h-2 rounded-full bg-blue-400 animate-pulse" /> Running
-            </span>
-            <span className="flex items-center gap-1">
-              <span className="w-2 h-2 rounded-full bg-red-400" /> Error
-            </span>
-          </div>
+    <div className="h-full flex flex-col p-4">
+      <div className="flex items-center justify-between mb-4 pb-4 border-b border-white/[0.05]">
+        <div className="flex items-center gap-4 text-[10px] font-bold uppercase tracking-widest text-slate-400">
+          <span className="flex items-center gap-1.5">
+            <span className="w-2 h-2 rounded-full bg-emerald-400" /> Success
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="w-2 h-2 rounded-full bg-purple-400 animate-pulse shadow-[0_0_8px_rgba(147,51,234,0.6)]" /> Processing
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="w-2 h-2 rounded-full bg-rose-400" /> Error
+          </span>
         </div>
         
         <div className="flex items-center gap-2">
           <button
             onClick={() => setViewMode(viewMode === 'simplified' ? 'detailed' : 'simplified')}
-            className="p-2 hover:bg-white/10 rounded-lg transition-colors"
-            title={viewMode === 'simplified' ? 'Show detailed view' : 'Show simplified view'}
+            className="p-2 hover:bg-white/[0.05] border border-transparent hover:border-white/10 rounded-lg transition-colors text-slate-400 hover:text-white"
+            title={viewMode === 'simplified' ? 'Expand Data' : 'Collapse Data'}
           >
-            {viewMode === 'simplified' ? (
-              <Maximize2 className="w-4 h-4" />
-            ) : (
-              <Minimize2 className="w-4 h-4" />
-            )}
+            {viewMode === 'simplified' ? <Maximize2 className="w-4 h-4" /> : <Minimize2 className="w-4 h-4" />}
           </button>
           {!isPreview && (
             <button
               onClick={() => refetch()}
-              className="p-2 hover:bg-white/10 rounded-lg transition-colors"
+              className="p-2 hover:bg-white/[0.05] border border-transparent hover:border-white/10 rounded-lg transition-colors text-slate-400 hover:text-white"
             >
               <RefreshCw className="w-4 h-4" />
             </button>
@@ -408,32 +335,28 @@ export function GraphVisualizer({
         </div>
       </div>
       
-      {/* Graph container */}
-      <div 
-        ref={containerRef}
-        className="flex-1 overflow-y-auto space-y-3 pr-2"
-        style={{ scrollbarWidth: 'thin' }}
-      >
-        {mockNodes.map((node) => (
-          <GraphNodeVisual
-            key={node.id}
-            node={node}
-            isExpanded={expandedNodes.has(node.id)}
-            onToggle={() => {
-              toggleNode(node.id);
-              if (onNodeClick) onNodeClick(node);
-            }}
-            onRetry={() => handleRetry(node)}
-          />
-        ))}
+      <div ref={containerRef} className="flex-1 overflow-y-auto space-y-2.5 pr-2 thin-scrollbar">
+        {activeNodes.length > 0 ? (
+          activeNodes.map((node) => (
+            <GraphNodeVisual
+              key={node.id}
+              node={node}
+              isExpanded={expandedNodes.has(node.id) || viewMode === 'detailed'}
+              onToggle={() => {
+                toggleNode(node.id);
+                if (onNodeClick) onNodeClick(node);
+              }}
+              onRetry={() => handleRetry(node)}
+            />
+          ))
+        ) : (
+          <div className="flex flex-col items-center justify-center h-full text-slate-500">
+             <Network className="w-8 h-8 mb-4 opacity-30 text-purple-500" />
+             <p className="text-[10px] font-bold tracking-widest uppercase">No Telemetry Available</p>
+             <p className="text-xs font-mono mt-1 opacity-70">Awaiting Graph Execution...</p>
+          </div>
+        )}
       </div>
-      
-      {/* Legend for preview mode */}
-      {isPreview && (
-        <div className="mt-4 pt-4 border-t border-white/10 text-xs text-white/60">
-          <p>Preview mode: Showing sample workflow. Click nodes to expand details.</p>
-        </div>
-      )}
     </div>
   );
 }

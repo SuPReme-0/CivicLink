@@ -41,35 +41,35 @@ class WhatsAppPayload(BaseModel):
 gatekeeper_llm = ChatGroq(
     api_key=settings.GROQ_API_KEY, 
     model_name=settings.GROQ_MODEL,
-    temperature=0.2, 
-    max_retries=2
+    temperature=0.3, # Slightly higher for more natural empathy
+    max_retries=3
 )
 
+# 🚨 UPGRADED PROMPT FOR MAXIMUM HUMANISM & EMPATHY
 GATEKEEPER_PROMPT = """
-You are the CivicLink Community Support Agent. 
-Your tone is warm, deeply empathetic, yet professional and efficient. You are a helpful human dispatcher, NOT a robotic form.
+You are the CivicLink Intake Concierge. You are a highly empathetic, professional human dispatcher. 
+Your job is to safely gather details about a municipal issue and prepare it for official dispatch.
 
-CONVERSATIONAL RULES (CRITICAL):
-1. NO AMNESIA: Look at the "PREVIOUS CONTEXT". Do NOT repeat acknowledgments. If you already said "I have your photo" or "I have your location" previously, NEVER say it again. Just answer their current question naturally.
-2. POST-FILING CHATTER: If the user asks a follow-up question after authorizing the report (e.g., "Is it done already?", "How long will it take?"), DO NOT try to gather more details or ask if they want to start a new report. Simply reassure them naturally: "Yes, your report is officially in our system and is currently being routed to the dispatch team."
+CONVERSATIONAL DIRECTIVES:
+1. EMPATHY FIRST: Always validate the user's frustration or danger immediately. (e.g., "I'm so sorry you're dealing with that flooded street, that sounds incredibly unsafe.")
+2. NO AMNESIA: Read the "PREVIOUS CONTEXT". If you already acknowledged a photo or GPS location, DO NOT say "I see you attached a photo" again. Move the conversation forward.
+3. THE 4 PILLARS: You must discreetly gather:
+   - The Incident (What is wrong?)
+   - The Impact (How is it affecting them?)
+   - The Sensors (Encourage a photo or GPS pin if they haven't provided one, but don't force it).
+   - The Authorization (Ask: "Are you ready for me to formally file this report?")
+4. CONCISE PROFESSIONALISM: Do not output massive walls of text. Be brief, warm, and clear.
 
-INTAKE GOAL (Only if the report is not yet filed):
-Gather these 4 pillars. If a pillar is already mentioned in 'Grievance details', DO NOT ask about it.
-1. THE INCIDENT: What is happening?
-2. THE HUMAN IMPACT: Acknowledge the danger/frustration. (e.g., "That sounds incredibly dangerous.")
-3. THE SENSORS: GPS and Photos.
-4. FINAL CONSENT: Formal authorization to file.
-
-WHEN USER AUTHORIZES ("Proceed", "Submit", "Send it", "File it"):
+WHEN THE USER AUTHORIZES DISPATCH (e.g., "Yes, send it", "Proceed", "File it"):
 - Set "is_complete": true.
-- Reply with a final confirmation: "Understood. I am cryptographically signing your report now and dispatching it to the relevant department. We'll get this sorted out."
+- Reply with a definitive hand-off message: "Understood. I am locking in your coordinates and compiling the legal directive now. I will cryptographically sign this and route it to the correct municipal authority. You can monitor the live pipeline status on your screen."
 
-CRITICAL INSTRUCTION: Respond ONLY with a raw JSON object. Do not include markdown formatting or conversational preamble.
+CRITICAL INSTRUCTION: Output ONLY a raw JSON object. Do not use markdown tags like ```json. 
 
 {
     "is_complete": true/false,
-    "reply_message": "Warm, natural, state-aware response",
-    "compiled_summary": "Detailed summary of facts for the official record.",
+    "reply_message": "Your empathetic, state-aware response to the user.",
+    "compiled_summary": "A highly detailed, professional summary of the facts gathered so far (for the database).",
     "issue_category": "ROADS" | "SANITATION" | "WATER" | "ELECTRICITY" | "OTHER" | null,
     "severity_level": "LOW" | "MEDIUM" | "HIGH" | "CRITICAL" | null
 }
@@ -110,8 +110,6 @@ def _scrub_pii(text: str) -> Tuple[str, List[str]]:
 # ---------------------------------------------------------
 # 3. THE NODE EXECUTION
 # ---------------------------------------------------------
-# Inside backend/brain/nodes/ingest_node.py
-
 async def ingest_node(state: CivicLinkState, config: RunnableConfig) -> dict:
     execution_ts = datetime.now(timezone.utc)
     thread_id = state.get("thread_id", config.get("configurable", {}).get("thread_id", "unknown"))
@@ -119,7 +117,6 @@ async def ingest_node(state: CivicLinkState, config: RunnableConfig) -> dict:
     with tracer.start_as_current_span("ingest_node") as span:
         logger.info(f"\n🟢 [INGEST NODE] Starting processing for thread: {thread_id}")
 
-        # 🚨 FIX 2: BYPASS THE DB MEMORY. Read directly from the HTTP Payload!
         configurable = config.get("configurable", {})
         raw_payload = configurable.get("raw_payload", {})
         
@@ -129,13 +126,13 @@ async def ingest_node(state: CivicLinkState, config: RunnableConfig) -> dict:
         
         vlm_output = state.get("vlm_output")
 
-        # The VLM Skip check
+        # The VLM Skip check (If image exists but hasn't been analyzed)
         if image_url and not vlm_output:
             logger.info("Ingest: Unverified image detected. Deferring to VLM Forensics.")
             return {"current_status": "VERIFYING_IMAGE"}
             
         try:
-            # 2. Validation & Sanitization
+            # Validation & Sanitization
             validated = WhatsAppPayload(
                 text_body=user_input,
                 image_url=image_url,
@@ -146,25 +143,25 @@ async def ingest_node(state: CivicLinkState, config: RunnableConfig) -> dict:
             
             safe_text = _sanitize_input(validated.text_body)
             if any(pat.search(safe_text) for pat in INJECTION_PATTERNS):
-                return {"is_grievance_complete": False, "conversational_reply": "I am unable to process that request. Let's start over—what is the issue you're facing?"}
+                return {"is_grievance_complete": False, "conversational_reply": "I am unable to process that request due to security constraints. Let's start over—what is the municipal issue you're facing?"}
 
             scrubbed_text, _ = _scrub_pii(safe_text)
             has_gps = validated.latitude is not None and validated.longitude is not None
             
-            # 3. VLM Context Injection
+            # VLM Context Injection
             vlm_context = ""
             if vlm_output:
                 img_desc = vlm_output.get("image_description", "No description provided.")
-                vlm_context = f"\n[SYSTEM: VLM analyzed attached image. Description: {img_desc}]\n"
+                vlm_context = f"\n[SYSTEM MEMORY: You have already analyzed the user's photo. Description: {img_desc}]\n"
 
-            # 4. Prompt Construction
+            # Prompt Construction
             previous_reply = state.get("conversational_reply", "None (First contact)")
             previous_summary = state.get("extracted_text", "None")
 
             ai_context = f"""
             --- PREVIOUS CONTEXT ---
-            What you just asked the user: "{previous_reply}"
-            Grievance details gathered so far: "{previous_summary}"
+            What you just said to the user: "{previous_reply}"
+            Grievance facts gathered so far: "{previous_summary}"
             
             --- CURRENT INPUT ---
             User's New Message: "{scrubbed_text}"
@@ -175,16 +172,22 @@ async def ingest_node(state: CivicLinkState, config: RunnableConfig) -> dict:
             
             logger.info(f"🧠 [THINKING LAYER] Sending prompt to Groq...\n{ai_context}")
             
-            # 5. Groq Execution
             response = await gatekeeper_llm.ainvoke([
                 SystemMessage(content=GATEKEEPER_PROMPT),
                 HumanMessage(content=ai_context)
             ])
             
-            logger.info(f"🤖 [THINKING LAYER] Groq Raw Response: {response.content}")
-            
-            # 6. JSON Extraction
+            # 🚨 HARDENED JSON EXTRACTION
             raw_content = response.content.strip()
+            
+            # Strip markdown formatting if the LLM disobeys the instruction
+            if raw_content.startswith("```json"):
+                raw_content = raw_content[7:]
+            if raw_content.startswith("```"):
+                raw_content = raw_content[3:]
+            if raw_content.endswith("```"):
+                raw_content = raw_content[:-3]
+                
             start_idx = raw_content.find('{')
             end_idx = raw_content.rfind('}')
             
@@ -196,14 +199,14 @@ async def ingest_node(state: CivicLinkState, config: RunnableConfig) -> dict:
 
             image_hash = hashlib.sha256(str(validated.image_url).encode("utf-8")).hexdigest() if validated.image_url else None
 
-            # 7. State Updates
+            # State Updates
             return {
                 "extracted_text": parsed_intent.get("compiled_summary", scrubbed_text),
                 "image_hash": image_hash,
                 "is_grievance_complete": parsed_intent.get("is_complete", False),
                 "conversational_reply": parsed_intent.get("reply_message", "Processing..."),
-                "issue_category": parsed_intent.get("issue_category"),
-                "severity_level": parsed_intent.get("severity_level"),
+                "issue_category": parsed_intent.get("issue_category", "OTHER"),
+                "severity_level": parsed_intent.get("severity_level", "LOW"),
                 "current_status": "PENDING_DETAILS",
                 "status_updates": [{
                     "node": "ingest", 
@@ -213,6 +216,12 @@ async def ingest_node(state: CivicLinkState, config: RunnableConfig) -> dict:
                 }]
             }
 
+        except json.JSONDecodeError as je:
+            logger.error(f"❌ [JSON PARSE ERROR] LLM output was not valid JSON: {response.content}")
+            return {
+                "is_grievance_complete": False,
+                "conversational_reply": "I'm sorry, I encountered a brief system error parsing that. Could you confirm if you are ready to file this report?"
+            }
         except Exception as e:
             logger.error(f"❌ [CRITICAL ERROR] Ingest Node Failure: {str(e)}", exc_info=True)
             span.record_exception(e)

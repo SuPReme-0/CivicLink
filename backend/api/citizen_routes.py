@@ -1,36 +1,52 @@
-# backend/api/citizen_routes.py
 import hashlib
 import os
 import asyncio
+import logging
+import bcrypt
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel
 from typing import Optional
-from backend.core.db import prisma
 
+from backend.core.db import prisma 
+
+logger = logging.getLogger(__name__)
 citizen_router = APIRouter()
 
-# --- Pydantic Schemas ---
+# ---------------------------------------------------------
+# PYDANTIC SCHEMAS (Strictly Synced with Frontend)
+# ---------------------------------------------------------
 class CitizenRegisterReq(BaseModel):
     username: str
-    passwordHash: str
-    phone: Optional[str] = None
+    password: str 
+    phone_number: Optional[str] = None
 
 class CitizenLoginReq(BaseModel):
     username: str
-    passwordHash: str
+    password: str
 
-# --- Dependency: Verify Citizen Session ---
+# ---------------------------------------------------------
+# DEPENDENCY: SESSION VERIFICATION
+# ---------------------------------------------------------
 async def verify_citizen_session(request: Request):
-    """Extracts Bearer token, hashes it, and validates against active CitizenSessions."""
+    """
+    Extracts session token from either X-Session-ID (Web Frontend) 
+    or Bearer token (Mobile/API), hashes it, and validates.
+    """
+    session_id = request.headers.get("X-Session-ID")
     auth_header = request.headers.get("Authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
+
+    raw_token = None
+    if session_id:
+        raw_token = session_id
+    elif auth_header and auth_header.startswith("Bearer "):
+        raw_token = auth_header.split(" ")[1]
+
+    if not raw_token:
         raise HTTPException(status_code=401, detail="Missing or invalid authentication token")
     
-    raw_token = auth_header.split(" ")[1]
-    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    token_hash = hashlib.sha256(raw_token.encode('utf-8')).hexdigest()
     
-    # 🚨 FIX: Replaced utcnow() with timezone-aware datetime
     session = await prisma.citizensession.find_first(
         where={
             "sessionTokenHash": token_hash,
@@ -40,10 +56,10 @@ async def verify_citizen_session(request: Request):
         include={"citizen": True}
     )
     
-    if not session:
+    if not session or not session.citizen:
         raise HTTPException(status_code=401, detail="Session expired or invalid")
         
-    # 🚨 FIX: Actually fire-and-forget to remove database latency from the auth middleware
+    # Fire-and-forget: Update last active timestamp without blocking the request latency
     asyncio.create_task(
         prisma.citizensession.update(
             where={"id": session.id},
@@ -53,8 +69,9 @@ async def verify_citizen_session(request: Request):
     
     return session.citizen
 
-# --- Routes ---
-
+# ---------------------------------------------------------
+# ROUTES
+# ---------------------------------------------------------
 def generate_session_token():
     return os.urandom(32).hex()
 
@@ -64,46 +81,71 @@ async def register_citizen(req: CitizenRegisterReq):
     if existing:
         raise HTTPException(status_code=400, detail="Username already taken")
 
-    phone_hash = hashlib.sha256(req.phone.encode()).hexdigest() if req.phone else f"anon-{os.urandom(8).hex()}"
+    # 1. Anonymized Phone Hashing for Blind Indexing
+    phone_hash = hashlib.sha256(req.phone_number.encode('utf-8')).hexdigest() if req.phone_number else f"anon-{os.urandom(8).hex()}"
+
+    # 2. Secure Bcrypt Password Hashing
+    try:
+        salt = bcrypt.gensalt()
+        secure_password_hash = bcrypt.hashpw(req.password.encode('utf-8'), salt).decode('utf-8')
+    except Exception as e:
+        logger.error(f"Encryption Failure during registration: {e}")
+        raise HTTPException(status_code=500, detail="Internal cryptography error")
 
     try:
         new_citizen = await prisma.citizen.create(
             data={
                 "username": req.username,
-                # ⚠️ SECURITY NOTE: Upgrade to bcrypt (passlib) before production launch
-                "passwordHash": hashlib.sha256(req.passwordHash.encode()).hexdigest(),
+                "passwordHash": secure_password_hash,
                 "phoneHash": phone_hash,
-                "encryptedPhone": "encrypted-placeholder", # Requires KMS in prod
+                "encryptedPhone": "encrypted-placeholder", # To be replaced with KMS encryption in production
             }
         )
         return {"status": "success", "citizen_id": new_citizen.id}
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Citizen Registration Failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="An internal error occurred during registration.")
+
 
 @citizen_router.post("/login")
-async def login_citizen(req: CitizenLoginReq):
+async def login_citizen(req: CitizenLoginReq, request: Request):
     citizen = await prisma.citizen.find_unique(where={"username": req.username})
+    
+    # Generic failure message prevents user enumeration attacks
     if not citizen or not citizen.passwordHash:
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    hashed_input = hashlib.sha256(req.passwordHash.encode()).hexdigest()
-    if citizen.passwordHash != hashed_input:
+    # Verify Bcrypt Hash
+    try:
+        is_valid_password = bcrypt.checkpw(
+            req.password.encode('utf-8'), 
+            citizen.passwordHash.encode('utf-8')
+        )
+    except ValueError:
+        # Catches legacy corrupted passwords without crashing the server
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    if not is_valid_password:
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
+    # Generate Secure Session
     raw_token = generate_session_token()
-    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    token_hash = hashlib.sha256(raw_token.encode('utf-8')).hexdigest()
+    
+    client_ip = request.client.host if request.client else "unknown"
+    user_agent = request.headers.get("User-Agent", "unknown")
 
-    # 🚨 FIX: Replaced utcnow() with timezone-aware datetime
     await prisma.citizensession.create(
         data={
             "citizenId": citizen.id,
             "sessionTokenHash": token_hash,
             "expiresAt": datetime.now(timezone.utc) + timedelta(days=7),
-            "ipAddress": "127.0.0.1" # In prod, extract from Request
+            "ipAddress": client_ip,
+            "userAgent": user_agent[:255] if user_agent else "unknown" # Truncate to prevent payload bloat
         }
     )
     
-    # Update citizen's last login
     await prisma.citizen.update(
         where={"id": citizen.id}, 
         data={"lastWebLoginAt": datetime.now(timezone.utc)}
@@ -118,11 +160,11 @@ async def login_citizen(req: CitizenLoginReq):
         }
     }
 
+
 @citizen_router.get("/me/grievances")
 async def get_my_grievances(current_citizen = Depends(verify_citizen_session)):
     """
     Returns all historical grievances for the logged-in citizen.
-    The frontend uses the `threadId` from this response to resume the LangGraph chat!
     """
     try:
         grievances = await prisma.grievancecase.find_many(
@@ -130,8 +172,8 @@ async def get_my_grievances(current_citizen = Depends(verify_citizen_session)):
             order={"updatedAt": "desc"}
         )
         
-        # 🚨 FIX: Safe ISO 8601 formatting for React/Next.js date parsers
         def format_date(dt):
+            if not dt: return None
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
             return dt.isoformat().replace("+00:00", "Z")
@@ -141,14 +183,16 @@ async def get_my_grievances(current_citizen = Depends(verify_citizen_session)):
             "grievances": [
                 {
                     "id": g.id,
-                    "trackingId": g.trackingId,
-                    "threadId": g.threadId, 
-                    "issueCategory": g.issueCategory,
+                    "tracking_id": g.trackingId,     
+                    "thread_id": g.threadId,         
+                    "issue_category": g.issueCategory, 
                     "severity": g.severity,
                     "status": g.status,
-                    "updatedAt": format_date(g.updatedAt)
+                    "created_at": format_date(g.createdAt), 
+                    "updated_at": format_date(g.updatedAt)
                 } for g in grievances
             ]
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        logger.error(f"Failed to fetch grievances for {current_citizen.id}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve grievance history.")
