@@ -11,10 +11,13 @@ const nextConfig = {
     ]
   },
   async rewrites() {
+    // 🚨 FIX: Provide a safe fallback so 'undefined' doesn't corrupt the build manifest
+    const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
+    
     return [
       {
         source: '/api/:path*',
-        destination: `${process.env.NEXT_PUBLIC_API_URL}/api/:path*`
+        destination: `${apiUrl}/api/:path*`
       }
     ];
   }

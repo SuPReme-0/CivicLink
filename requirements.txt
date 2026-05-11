@@ -56,3 +56,4 @@ uvloop>=0.20.0
 
 email-validator>=2.0.0
 langchain-groq>=0.1.0
+langchain-google-genai>=0.1.0
